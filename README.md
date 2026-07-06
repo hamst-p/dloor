@@ -3,94 +3,104 @@
 > Educational purpose only.
 >
 > dloor is intended for learning, personal tooling experiments, and lawful personal archiving. Use it only with content you own, content in the public domain, or content you have explicit permission to download. You are responsible for complying with copyright law, platform terms of service, and any other rules that apply in your jurisdiction. This project does not encourage or support infringement, redistribution of copyrighted material, bypassing access controls, or downloading private content without authorization.
->
-> このプロジェクトは教育・学習目的のサンプルです。自分が権利を持つコンテンツ、パブリックドメインのコンテンツ、または明示的に許可を得たコンテンツにのみ使用してください。著作権法、各プラットフォームの利用規約、居住地域の法令を遵守する責任は利用者にあります。
 
-`dloor-tui` は `yt-dlp` と `ffmpeg` を利用する Rust 製 TUI マルチメディアダウンローダーです。YouTube、YouTube Shorts、Instagram、Instagram Reels、TikTok、Facebook、X (Twitter) の URL を自動判別し、動画または音声として保存できます。
+`dloor` is a Rust TUI multimedia downloader powered by `yt-dlp` and `ffmpeg`. It detects supported social/video URLs automatically and lets you download media as video or audio.
 
-## 構成
+Supported URL families:
 
-- `dloor-core`: TUI に依存しないダウンロード用ライブラリクレート
-- `dloor-tui`: Ratatui / crossterm で実装した TUI フロントエンド
+- YouTube
+- YouTube Shorts
+- Instagram
+- Instagram Reels
+- TikTok
+- Facebook
+- X / Twitter
 
-将来的に Telegram や Slack などのチャット連携を追加する場合も、`dloor-core` の `DownloadEvent` ストリームを購読するだけで同じコア処理を再利用できます。
+## Project Structure
 
-## 前提ツール
+- `dloor-core`: UI-independent core library for platform detection, configuration, dependency checks, and download jobs
+- `dloor-tui`: Ratatui / crossterm terminal frontend
 
-必須:
+The core download logic is intentionally separated from the TUI. Future chat integrations, such as Telegram or Slack agents, can reuse `dloor-core` by subscribing to the same `DownloadEvent` stream.
+
+## Requirements
+
+Required:
 
 - `yt-dlp`
 - `ffmpeg`
 
-クラウド保存を使う場合:
+Optional for cloud uploads:
 
 - `rclone`
-- 事前に `rclone config` で remote を設定
+- A preconfigured remote from `rclone config`
 
-macOS 例:
+macOS example:
 
 ```bash
 brew install yt-dlp ffmpeg rclone
 ```
 
-Linux 例:
+Linux example:
 
 ```bash
 python3 -m pip install -U yt-dlp
 sudo apt install ffmpeg rclone
 ```
 
-## ビルドと実行
+## Build And Run
+
+For development:
 
 ```bash
 cargo build --release
 cargo run -p dloor-tui
 ```
 
-`dloor` コマンドとしてインストールする場合:
+To install the `dloor` command:
 
 ```bash
 cargo install --path dloor-tui --force
 dloor
 ```
 
-インストール先は通常 `~/.cargo/bin/dloor` です。`dloor` が見つからない場合は、`~/.cargo/bin` が `PATH` に含まれているか確認してください。
+The executable is usually installed at `~/.cargo/bin/dloor`. If your shell cannot find `dloor`, make sure `~/.cargo/bin` is included in your `PATH`.
 
-テスト:
+## Tests
 
 ```bash
 cargo test
 cargo clippy -- -D warnings
 ```
 
-## 使い方
+## Usage
 
-初回起動時に保存先を設定します。
+On first launch, choose where downloads should be saved.
 
-- Local: ローカルディレクトリへ保存
-- Cloud: `rclone` remote と remote path を指定してアップロード
+- Local: save files to a local directory
+- Cloud: upload files through an `rclone` remote and remote path
 
-メイン画面では URL を貼り付けて Enter を押します。次に保存形式と品質を選ぶとダウンロードが始まります。
+On the main screen, paste a URL and press `Enter`. Then choose the output format and quality. The download screen shows progress in real time.
 
-## キー操作
+## Key Commands
 
-- URL入力: URL を貼り付けて `Enter`
-- `/settings`: 保存先設定を開く
-- `/howtouse`: 使い方を表示
-- `/quit`: 終了
-- `q`: URL入力画面または完了画面で終了
-- `Esc`: 戻る、または終了
-- 矢印キー: 選択肢の移動
-- `Tab`: 設定項目の移動
-- `Enter`: 決定
+- URL input: paste a URL and press `Enter`
+- `/settings`: open destination settings
+- `/howtouse`: show the short usage guide
+- `/quit`: quit
+- `q`: quit from the URL input or completion screen
+- `Esc`: go back, or quit from the URL input screen
+- Arrow keys: move between choices
+- `Tab`: move between setup fields
+- `Enter`: confirm
 
-## 品質プリセット
+## Quality Presets
 
-- Video / Best: `bestvideo*+bestaudio/best` を mp4 にマージ
-- Video / Compressed: 1080p 上限で取得し、`ffmpeg` で `libx264 -crf 28 -preset fast` に再エンコード
-- Audio / Best: m4a、最高品質
-- Audio / Compressed: mp3、`--audio-quality 5`
+- Video / Best: downloads `bestvideo*+bestaudio/best` and merges to mp4
+- Video / Compressed: downloads up to 1080p, then re-encodes with `ffmpeg` using `libx264 -crf 28 -preset fast`
+- Audio / Best: extracts m4a at best available quality
+- Audio / Compressed: extracts mp3 with `--audio-quality 5`
 
-## 設定ファイル
+## Configuration
 
-設定は OS 標準の設定ディレクトリに `config.toml` として保存されます。パスは `directories` クレートの `ProjectDirs` に従います。
+Configuration is stored as `config.toml` in the operating system's standard config directory, resolved through the `directories` crate.
