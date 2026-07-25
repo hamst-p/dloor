@@ -666,11 +666,21 @@ async fn transcode_video(input: &Path, cancellation: &CancellationToken) -> Resu
     let status = wait_for_process(&mut child, cancellation).await?;
 
     if status.success() {
-        fs::remove_file(input).await?;
-        Ok(output)
+        finalize_transcode(input, &output).await
     } else {
         Err(Error::ProcessFailed(format!("ffmpeg exited with {status}")))
     }
+}
+
+async fn finalize_transcode(input: &Path, output: &Path) -> Result<PathBuf> {
+    let metadata = fs::metadata(output)
+        .await
+        .map_err(|_| Error::MissingOutputFile)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(Error::MissingOutputFile);
+    }
+    fs::remove_file(input).await?;
+    Ok(output.to_path_buf())
 }
 
 async fn upload_to_cloud(
@@ -894,5 +904,33 @@ mod tests {
         };
 
         assert!(!partial_path.exists());
+    }
+
+    #[tokio::test]
+    async fn successful_transcode_keeps_only_the_confirmed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("video.mp4");
+        let output = dir.path().join("video.compressed.mp4");
+        fs::write(&input, b"source").await.unwrap();
+        fs::write(&output, b"compressed").await.unwrap();
+
+        let completed_path = finalize_transcode(&input, &output).await.unwrap();
+
+        assert_eq!(completed_path, output);
+        assert!(!input.exists());
+        assert!(output.exists());
+    }
+
+    #[tokio::test]
+    async fn missing_transcode_output_does_not_delete_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("video.mp4");
+        let output = dir.path().join("video.compressed.mp4");
+        fs::write(&input, b"source").await.unwrap();
+
+        let result = finalize_transcode(&input, &output).await;
+
+        assert!(matches!(result, Err(Error::MissingOutputFile)));
+        assert!(input.exists());
     }
 }
