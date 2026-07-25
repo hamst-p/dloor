@@ -79,6 +79,26 @@ dloor
 
 ## Installation Options
 
+### Prebuilt Binaries
+
+Tagged releases provide archives for:
+
+- macOS on Apple Silicon (`aarch64-apple-darwin`)
+- macOS on Intel (`x86_64-apple-darwin`)
+- Linux x86_64 with glibc (`x86_64-unknown-linux-gnu`)
+
+Download the archive for your platform from
+[GitHub Releases](https://github.com/hamst-p/dloor/releases), verify it against
+the accompanying `SHA256SUMS`, extract it, and move `dloor` to a directory on
+your `PATH`. The archive does not bundle `yt-dlp`, `ffmpeg`, or `rclone`; install
+those separately as described under Requirements.
+
+Windows is not a supported release target in this phase. The Rust UI stack is
+portable, but process cancellation, updater/package-manager guidance, filesystem
+publication semantics, and the external-tool installation path have not yet
+been validated together on Windows. Building from source there may work, but it
+is not covered by CI or release testing.
+
 ### Install From GitHub
 
 If Rust is already installed, you can install directly from the repository:
@@ -463,15 +483,22 @@ manager when it can identify one. dloor never updates automatically.
 Run checks before opening a pull request:
 
 ```bash
-cargo fmt --all
-cargo test
-cargo clippy -- -D warnings
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
+
+Pull requests and pushes to `main` run the same checks on Ubuntu through GitHub
+Actions, with Cargo registry, Git, and build caches. Pushing a `v*` tag whose
+value exactly matches the shared Cargo package version runs the quality gate,
+builds the three supported native targets, publishes `.tar.gz` archives, and
+generates `SHA256SUMS` in a GitHub Release.
 
 Project layout:
 
 - `dloor-core`: UI-independent core library for platform detection, configuration, dependency checks, and download jobs
 - `dloor-tui`: Ratatui / crossterm terminal frontend
+- `.github/workflows`: pull-request checks and tagged native-release automation
 
 The core download logic is intentionally separated from the TUI. Future chat integrations, such as Telegram or Slack agents, can reuse `dloor-core` by subscribing to the same `DownloadEvent` stream.
 

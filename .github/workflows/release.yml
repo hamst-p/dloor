@@ -1,0 +1,214 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+
+      - name: Match tag to workspace version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          version="$(
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -er '
+                [.packages[].version] | unique |
+                if length == 1 then
+                  .[0]
+                else
+                  error("workspace packages do not share one version")
+                end
+              '
+          )"
+
+          if [[ "$RELEASE_TAG" != "v$version" ]]; then
+            printf 'Release tag %s does not match workspace version v%s\n' \
+              "$RELEASE_TAG" "$version" >&2
+            exit 1
+          fi
+
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+  quality:
+    name: Release quality gate
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy \
+            --no-self-update
+          rustup default stable
+
+      - name: Cache Cargo data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-release-quality-${{ runner.os }}-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-quality-${{ runner.os }}-stable-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs:
+      - validate
+      - quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install stable Rust target
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Cache Cargo data
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-release-${{ runner.os }}-${{ matrix.target }}-stable-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-release-${{ runner.os }}-${{ matrix.target }}-stable-
+
+      - name: Build release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --workspace --release --locked --bins --target "$TARGET"
+
+      - name: Create release archive
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          archive_root="dloor-$VERSION-$TARGET"
+          binary_dir="target/$TARGET/release"
+          staging_dir="dist/$archive_root"
+
+          mkdir -p "$staging_dir"
+          install -m 0755 "$binary_dir/dloor" "$staging_dir/dloor"
+
+          if [[ -x "$binary_dir/dloor-cli" ]]; then
+            install -m 0755 "$binary_dir/dloor-cli" "$staging_dir/dloor-cli"
+          fi
+
+          cp README.md LICENSE "$staging_dir/"
+          tar -C dist -czf "dist/$archive_root.tar.gz" "$archive_root"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download release archives
+        uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum ./*.tar.gz > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            ./dist/*.tar.gz \
+            ./dist/SHA256SUMS \
+            --verify-tag \
+            --title "dloor $VERSION" \
+            --generate-notes
