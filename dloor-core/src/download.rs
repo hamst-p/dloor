@@ -1,10 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
 };
 
-use tempfile::TempDir;
+use tempfile::{NamedTempFile, TempDir};
 use tokio::{
     fs,
     io::{AsyncBufReadExt, BufReader},
@@ -377,10 +377,11 @@ impl DownloadJob {
         let completed_path = match &self.config.destination {
             Destination::Local { path } => {
                 fs::create_dir_all(path).await?;
-                let destination = unique_destination(path, &final_local).await?;
-                move_file(&final_local, &destination).await?;
+                let destination =
+                    install_local_file(&final_local, path, &self.cancellation).await?;
                 for sidecar in sidecars {
-                    if let Err(error) = move_sidecar(&sidecar, path).await {
+                    if let Err(error) = install_local_file(&sidecar, path, &self.cancellation).await
+                    {
                         warnings.push(DownloadWarning {
                             item: resolved.display.clone(),
                             kind: DownloadWarningKind::SubtitleSidecar,
@@ -421,7 +422,8 @@ impl DownloadJob {
                 format!("{}:{}/{}", remote, path.trim_matches('/'), file_name)
             }
         };
-        self.ensure_not_cancelled()?;
+        // Reaching here means local publication (or the requested cloud uploads)
+        // completed. A later cancellation must not revoke that committed result.
         Ok(ItemRunResult {
             path: completed_path,
             warnings,
@@ -1302,42 +1304,138 @@ pub fn parse_progress_line(line: &str) -> Option<DownloadProgress> {
     ProgressTracker::default().update(line)
 }
 
-async fn unique_destination(dir: &Path, source: &Path) -> Result<PathBuf> {
+const MAX_DESTINATION_ATTEMPTS: u32 = 10_000;
+
+fn destination_candidate(dir: &Path, source: &Path, counter: u32) -> Result<PathBuf> {
     let file_name = source
         .file_name()
         .ok_or_else(|| Error::InvalidPath(source.display().to_string()))?;
-    let candidate = dir.join(file_name);
-    if !fs::try_exists(&candidate).await? {
-        return Ok(candidate);
+    if counter == 0 {
+        return Ok(dir.join(file_name));
     }
 
     let stem = source
         .file_stem()
-        .ok_or_else(|| Error::InvalidPath(source.display().to_string()))?
-        .to_string_lossy();
-    let extension = source.extension().map(|ext| ext.to_string_lossy());
+        .ok_or_else(|| Error::InvalidPath(source.display().to_string()))?;
+    let mut suffixed_name = OsString::from(stem);
+    suffixed_name.push(format!(" ({counter})"));
+    if let Some(extension) = source.extension() {
+        suffixed_name.push(OsStr::new("."));
+        suffixed_name.push(extension);
+    }
+    Ok(dir.join(suffixed_name))
+}
 
-    for counter in 1..=10_000u32 {
-        let candidate = match &extension {
-            Some(ext) => dir.join(format!("{stem} ({counter}).{ext}")),
-            None => dir.join(format!("{stem} ({counter})")),
-        };
-        if !fs::try_exists(&candidate).await? {
-            return Ok(candidate);
+fn ensure_token_not_cancelled(cancellation: &CancellationToken) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+async fn install_local_file(
+    source: &Path,
+    destination_dir: &Path,
+    cancellation: &CancellationToken,
+) -> Result<PathBuf> {
+    for counter in 0..=MAX_DESTINATION_ATTEMPTS {
+        let destination = destination_candidate(destination_dir, source, counter)?;
+        // This is the last cancellation boundary before the atomic publication
+        // attempt. Once a name has been published, completion wins the race.
+        ensure_token_not_cancelled(cancellation)?;
+        match fs::hard_link(source, &destination).await {
+            Ok(()) => {
+                remove_work_copy_after_publish(source).await;
+                return Ok(destination);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                return copy_and_publish_local_file(source, destination_dir, counter, cancellation)
+                    .await;
+            }
         }
     }
 
-    Err(Error::InvalidPath(candidate.display().to_string()))
+    Err(Error::InvalidPath(
+        destination_candidate(destination_dir, source, MAX_DESTINATION_ATTEMPTS)?
+            .display()
+            .to_string(),
+    ))
 }
 
-async fn move_file(from: &Path, to: &Path) -> Result<()> {
-    if fs::rename(from, to).await.is_ok() {
-        return Ok(());
+async fn copy_and_publish_local_file(
+    source: &Path,
+    destination_dir: &Path,
+    first_counter: u32,
+    cancellation: &CancellationToken,
+) -> Result<PathBuf> {
+    ensure_token_not_cancelled(cancellation)?;
+    let staged = tempfile::Builder::new()
+        .prefix(".dloor-transfer-")
+        .suffix(".tmp")
+        .tempfile_in(destination_dir)?;
+    let mut source_file = fs::File::open(source).await?;
+    let source_permissions = source_file.metadata().await?.permissions();
+    let mut staged_file = fs::File::from_std(staged.reopen()?);
+
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+        result = tokio::io::copy(&mut source_file, &mut staged_file) => {
+            result?;
+        }
     }
-    // rename fails across filesystems (temp dir vs destination), so copy + remove instead
-    fs::copy(from, to).await?;
-    fs::remove_file(from).await?;
-    Ok(())
+    staged_file.set_permissions(source_permissions).await?;
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::Cancelled),
+        result = staged_file.sync_all() => result?,
+    }
+    drop(staged_file);
+
+    publish_staged_file(staged, source, destination_dir, first_counter, cancellation).await
+}
+
+async fn publish_staged_file(
+    mut staged: NamedTempFile,
+    source: &Path,
+    destination_dir: &Path,
+    first_counter: u32,
+    cancellation: &CancellationToken,
+) -> Result<PathBuf> {
+    for counter in first_counter..=MAX_DESTINATION_ATTEMPTS {
+        let destination = destination_candidate(destination_dir, source, counter)?;
+        // persist_noclobber atomically refuses an existing destination. Checking
+        // cancellation immediately before it defines publication as the commit point.
+        ensure_token_not_cancelled(cancellation)?;
+        match staged.persist_noclobber(&destination) {
+            Ok(file) => {
+                drop(file);
+                remove_work_copy_after_publish(source).await;
+                return Ok(destination);
+            }
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                staged = error.file;
+            }
+            Err(error) => return Err(error.error.into()),
+        }
+    }
+
+    Err(Error::InvalidPath(
+        destination_candidate(destination_dir, source, MAX_DESTINATION_ATTEMPTS)?
+            .display()
+            .to_string(),
+    ))
+}
+
+async fn remove_work_copy_after_publish(source: &Path) {
+    if let Err(error) = fs::remove_file(source).await {
+        debug!(
+            error = %error,
+            "published local output but could not remove its temporary work copy"
+        );
+    }
 }
 
 async fn collect_subtitle_sidecars(dir: &Path, media: &Path) -> Result<Vec<PathBuf>> {
@@ -1360,12 +1458,6 @@ async fn collect_subtitle_sidecars(dir: &Path, media: &Path) -> Result<Vec<PathB
     }
     sidecars.sort();
     Ok(sidecars)
-}
-
-async fn move_sidecar(sidecar: &Path, destination_dir: &Path) -> Result<PathBuf> {
-    let destination = unique_destination(destination_dir, sidecar).await?;
-    move_file(sidecar, &destination).await?;
-    Ok(destination)
 }
 
 fn transcode_args(input: &Path, output: &Path, preset: &TranscodePreset) -> Vec<OsString> {
@@ -1470,6 +1562,8 @@ async fn wait_for_process(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
 
     #[test]
@@ -1653,15 +1747,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unique_destination_appends_counter_when_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("video.mp4"), b"").await.unwrap();
+    async fn local_install_keeps_existing_file_and_appends_counter() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("video.mp4");
+        let existing = destination_dir.path().join("video.mp4");
+        fs::write(&source, b"new video").await.unwrap();
+        fs::write(&existing, b"existing video").await.unwrap();
 
-        let destination = unique_destination(dir.path(), Path::new("video.mp4"))
-            .await
+        let destination =
+            install_local_file(&source, destination_dir.path(), &CancellationToken::new())
+                .await
+                .unwrap();
+
+        assert_eq!(destination, destination_dir.path().join("video (1).mp4"));
+        assert_eq!(fs::read(existing).await.unwrap(), b"existing video");
+        assert_eq!(fs::read(destination).await.unwrap(), b"new video");
+        assert!(!source.exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_local_installs_claim_distinct_names_without_overwriting() {
+        let first_source_dir = tempfile::tempdir().unwrap();
+        let second_source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let first_source = first_source_dir.path().join("video.mp4");
+        let second_source = second_source_dir.path().join("video.mp4");
+        fs::write(&first_source, b"first").await.unwrap();
+        fs::write(&second_source, b"second").await.unwrap();
+        let cancellation = CancellationToken::new();
+
+        let (first, second) = tokio::join!(
+            install_local_file(&first_source, destination_dir.path(), &cancellation),
+            install_local_file(&second_source, destination_dir.path(), &cancellation),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_ne!(first, second);
+        let mut contents = vec![
+            fs::read(first).await.unwrap(),
+            fs::read(second).await.unwrap(),
+        ];
+        contents.sort();
+        assert_eq!(contents, [b"first".to_vec(), b"second".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn staged_copy_publishes_without_exposing_a_partial_final_file() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("video.mp4");
+        let existing = destination_dir.path().join("video.mp4");
+        fs::write(&source, b"copied video").await.unwrap();
+        fs::write(&existing, b"existing video").await.unwrap();
+
+        let destination = copy_and_publish_local_file(
+            &source,
+            destination_dir.path(),
+            0,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(destination, destination_dir.path().join("video (1).mp4"));
+        assert_eq!(fs::read(existing).await.unwrap(), b"existing video");
+        assert_eq!(fs::read(destination).await.unwrap(), b"copied video");
+        assert!(!source.exists());
+        let mut entries = fs::read_dir(destination_dir.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(
+                !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".dloor-transfer-"),
+                "the staging guard must clean up its temporary file"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_publish_keeps_source_and_cleans_stage() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("video.mp4");
+        fs::write(&source, b"source").await.unwrap();
+        let mut staged = tempfile::Builder::new()
+            .prefix(".dloor-transfer-")
+            .tempfile_in(destination_dir.path())
             .unwrap();
+        staged.write_all(b"staged").unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
 
-        assert_eq!(destination, dir.path().join("video (1).mp4"));
+        let result =
+            publish_staged_file(staged, &source, destination_dir.path(), 0, &cancellation).await;
+
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert!(source.exists());
+        assert!(!destination_dir.path().join("video.mp4").exists());
+        assert!(!staged_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_publish_does_not_revoke_committed_output() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let destination_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("video.mp4");
+        fs::write(&source, b"source").await.unwrap();
+        let mut staged = tempfile::Builder::new()
+            .prefix(".dloor-transfer-")
+            .tempfile_in(destination_dir.path())
+            .unwrap();
+        staged.write_all(b"staged").unwrap();
+        let cancellation = CancellationToken::new();
+
+        let destination =
+            publish_staged_file(staged, &source, destination_dir.path(), 0, &cancellation)
+                .await
+                .unwrap();
+        cancellation.cancel();
+
+        assert_eq!(fs::read(destination).await.unwrap(), b"staged");
+        assert!(!source.exists());
     }
 
     #[tokio::test]
