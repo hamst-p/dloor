@@ -22,6 +22,14 @@ Supported URL families:
 
 dloor is early-stage OSS software. The local download flow is the primary supported path today. Cloud upload support is designed around `rclone`, but should be treated as experimental while the project matures.
 
+## Features
+
+- Download a single authorized media item as video or audio
+- Expand an authorized playlist and process its items sequentially
+- Continue a playlist after individual item failures and report a final summary
+- Show separate current-item and overall playlist progress
+- Save locally or upload through an optional `rclone` remote
+
 ## Quick Start
 
 Install system prerequisites:
@@ -163,10 +171,11 @@ Then enter the remote name and remote path in dloor's setup screen.
 
 1. Paste a supported URL into the main screen.
 2. Press `Enter`.
-3. Choose `Video` or `Audio`.
-4. Choose `Best` or `Compressed`.
-5. Wait for the progress bar to complete.
-6. Copy the final path shown on the completion screen.
+3. Choose whether to download one item or the entire playlist.
+4. Choose `Video` or `Audio`.
+5. Choose `Best` or `Compressed`.
+6. Follow the current-item and overall progress bars.
+7. Review the successful paths and any failed items in the completion summary.
 
 ## Key Commands
 
@@ -177,7 +186,7 @@ Then enter the remote name and remote path in dloor's setup screen.
 - `q`: quit from the URL input or completion screen
 - `Esc`: go back, or quit from the URL input screen
 - `Esc` during a download: cancel the active `yt-dlp`, `ffmpeg`, or `rclone` process
-- Arrow keys: move between choices
+- Arrow keys: move between scope, format, and quality choices
 - `Tab`: move between setup fields
 - `Enter`: confirm
 

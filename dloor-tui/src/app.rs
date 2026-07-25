@@ -2,8 +2,8 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dloor_core::{
     check_dependencies, config::default_download_dir, detect_platform, Browser, Config,
-    Destination, DownloadEvent, DownloadJob, DownloadProgress, DownloadRequest, Format, Platform,
-    Quality,
+    Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress, DownloadRequest,
+    DownloadSummary, Format, Platform, PlaylistSelection, Quality,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +13,7 @@ pub enum Screen {
     Setup(SetupState),
     Main(MainState),
     HowToUse,
+    Playlist(PlaylistState),
     Format(FormatState),
     Quality(QualityState),
     Download(DownloadViewState),
@@ -28,12 +29,20 @@ pub struct MainState {
 #[derive(Debug)]
 pub struct FormatState {
     pub url: String,
+    pub playlist: PlaylistSelection,
+    pub selected: usize,
+}
+
+#[derive(Debug)]
+pub struct PlaylistState {
+    pub url: String,
     pub selected: usize,
 }
 
 #[derive(Debug)]
 pub struct QualityState {
     pub url: String,
+    pub playlist: PlaylistSelection,
     pub format: Format,
     pub selected: usize,
 }
@@ -43,7 +52,7 @@ pub struct DownloadViewState;
 
 #[derive(Debug)]
 pub struct CompleteState {
-    pub path: String,
+    pub summary: DownloadSummary,
 }
 
 #[derive(Debug)]
@@ -91,6 +100,7 @@ pub struct SharedState {
 #[derive(Debug)]
 pub struct ActiveDownload {
     pub platform: Option<Platform>,
+    pub item: Option<DownloadItem>,
     pub progress: Option<DownloadProgress>,
     pub status_text: String,
     receiver: mpsc::Receiver<DownloadEvent>,
@@ -116,9 +126,9 @@ enum Transition {
 
 #[derive(Debug)]
 enum DownloadTerminal {
-    Completed(String),
+    Finished(DownloadSummary),
     Failed(String),
-    Cancelled,
+    Cancelled(DownloadSummary),
 }
 
 #[derive(Debug)]
@@ -165,13 +175,18 @@ impl App {
         self.shared.spinner_index = self.shared.spinner_index.wrapping_add(1);
         let terminal = self.shared.poll_download();
         match terminal {
-            Some(DownloadTerminal::Completed(path)) => {
+            Some(DownloadTerminal::Finished(summary)) => {
                 self.navigation
-                    .replace(Screen::Complete(CompleteState { path }));
+                    .replace(Screen::Complete(CompleteState { summary }));
             }
             Some(DownloadTerminal::Failed(error)) => self.navigation.show_error(error),
-            Some(DownloadTerminal::Cancelled) => {
-                self.navigation.return_to_main(false);
+            Some(DownloadTerminal::Cancelled(summary)) => {
+                if summary.succeeded.is_empty() && summary.failed.is_empty() {
+                    self.navigation.return_to_main(false);
+                } else {
+                    self.navigation
+                        .replace(Screen::Complete(CompleteState { summary }));
+                }
             }
             None => {}
         }
@@ -187,6 +202,7 @@ impl App {
             Screen::Setup(state) => handle_setup_key(state, &mut self.shared, key),
             Screen::Main(state) => handle_main_key(state, &mut self.shared, key),
             Screen::HowToUse => handle_how_to_use_key(key),
+            Screen::Playlist(state) => handle_playlist_key(state, key),
             Screen::Format(state) => handle_format_key(state, &self.shared, key),
             Screen::Quality(state) => handle_quality_key(state, &mut self.shared, key),
             Screen::Download(_) => handle_download_key(&mut self.shared, key),
@@ -235,6 +251,7 @@ impl SharedState {
         let cancellation = job.cancellation_token();
         self.active_download = Some(ActiveDownload {
             platform,
+            item: None,
             progress: None,
             status_text: "Starting download...".to_string(),
             receiver: job.spawn(),
@@ -247,25 +264,49 @@ impl SharedState {
         let mut terminal = None;
         while let Ok(event) = active.receiver.try_recv() {
             match event {
-                DownloadEvent::Progress { progress, platform } => {
+                DownloadEvent::Resolving => {
+                    active.status_text = "Resolving items...".to_string();
+                }
+                DownloadEvent::ItemStarted { item, platform } => {
                     active.platform = Some(platform);
+                    active.item = Some(item);
+                    active.progress = None;
+                    active.status_text = "Starting item...".to_string();
+                }
+                DownloadEvent::Progress {
+                    progress,
+                    item,
+                    platform,
+                } => {
+                    active.platform = Some(platform);
+                    active.item = Some(item);
                     active.status_text = "Downloading".to_string();
                     active.progress = Some(progress);
                 }
-                DownloadEvent::Converting => {
+                DownloadEvent::Converting { item } => {
+                    active.item = Some(item);
                     active.status_text = "Converting...".to_string();
                 }
-                DownloadEvent::Uploading => {
+                DownloadEvent::Uploading { item } => {
+                    active.item = Some(item);
                     active.status_text = "Uploading...".to_string();
                 }
-                DownloadEvent::Completed { path } => {
-                    terminal = Some(DownloadTerminal::Completed(path));
+                DownloadEvent::ItemCompleted { result } => {
+                    active.item = Some(result.item);
+                    active.status_text = "Item completed".to_string();
+                }
+                DownloadEvent::ItemFailed { failure } => {
+                    active.item = Some(failure.item);
+                    active.status_text = "Item failed; continuing...".to_string();
+                }
+                DownloadEvent::Finished { summary } => {
+                    terminal = Some(DownloadTerminal::Finished(summary));
                 }
                 DownloadEvent::Failed { error } => {
                     terminal = Some(DownloadTerminal::Failed(error));
                 }
-                DownloadEvent::Cancelled => {
-                    terminal = Some(DownloadTerminal::Cancelled);
+                DownloadEvent::Cancelled { summary } => {
+                    terminal = Some(DownloadTerminal::Cancelled(summary));
                 }
             }
         }
@@ -388,7 +429,7 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
                 return Transition::Push(Screen::HowToUse);
             }
             match detect_platform(&input) {
-                Ok(_) => Transition::Push(Screen::Format(FormatState {
+                Ok(_) => Transition::Push(Screen::Playlist(PlaylistState {
                     url: input,
                     selected: 0,
                 })),
@@ -415,6 +456,27 @@ fn handle_how_to_use_key(key: KeyEvent) -> Transition {
     }
 }
 
+fn handle_playlist_key(state: &mut PlaylistState, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Esc => return Transition::Back,
+        KeyCode::Up | KeyCode::Left => move_selection(&mut state.selected, 2, false),
+        KeyCode::Down | KeyCode::Right => move_selection(&mut state.selected, 2, true),
+        KeyCode::Enter => {
+            return Transition::Push(Screen::Format(FormatState {
+                url: state.url.clone(),
+                playlist: if state.selected == 0 {
+                    PlaylistSelection::Single
+                } else {
+                    PlaylistSelection::All
+                },
+                selected: 0,
+            }));
+        }
+        _ => {}
+    }
+    Transition::Stay
+}
+
 fn handle_format_key(state: &mut FormatState, shared: &SharedState, key: KeyEvent) -> Transition {
     match key.code {
         KeyCode::Esc => return Transition::Back,
@@ -423,6 +485,7 @@ fn handle_format_key(state: &mut FormatState, shared: &SharedState, key: KeyEven
         KeyCode::Enter => {
             return Transition::Push(Screen::Quality(QualityState {
                 url: state.url.clone(),
+                playlist: state.playlist,
                 format: if state.selected == 0 {
                     Format::Video
                 } else {
@@ -454,6 +517,7 @@ fn handle_quality_key(
                 } else {
                     Quality::Compressed
                 },
+                playlist: state.playlist,
             });
             return Transition::Replace(Screen::Download(DownloadViewState));
         }
@@ -605,6 +669,7 @@ mod tests {
     fn format_screen() -> Screen {
         Screen::Format(FormatState {
             url: "https://youtube.com/watch?v=example".to_string(),
+            playlist: PlaylistSelection::Single,
             selected: 0,
         })
     }
@@ -612,6 +677,7 @@ mod tests {
     fn quality_screen() -> Screen {
         Screen::Quality(QualityState {
             url: "https://youtube.com/watch?v=example".to_string(),
+            playlist: PlaylistSelection::Single,
             format: Format::Video,
             selected: 0,
         })

@@ -30,6 +30,12 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         ),
         Screen::Main(state) => render_main(frame, state, &app.shared),
         Screen::HowToUse => render_how_to_use(frame),
+        Screen::Playlist(state) => render_choice(
+            frame,
+            "Download scope",
+            &["Single item", "Entire playlist"],
+            state.selected,
+        ),
         Screen::Format(state) => {
             render_choice(frame, "Format", &["Video", "Audio"], state.selected)
         }
@@ -277,10 +283,11 @@ fn render_choice(frame: &mut Frame<'_>, title: &str, options: &[&str], selected:
 fn render_download(frame: &mut Frame<'_>, active: Option<&ActiveDownload>, spinner_index: usize) {
     let chunks = base_layout(frame.area());
     render_logo(frame, chunks[0]);
-    let area = centered(chunks[1], 84, 12);
+    let area = centered(chunks[1], 84, 17);
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -292,21 +299,45 @@ fn render_download(frame: &mut Frame<'_>, active: Option<&ActiveDownload>, spinn
         .map(|platform| platform.label())
         .unwrap_or("Detecting...");
     let status_text = active.map_or("Finishing...", |download| download.status_text.as_str());
+    let item_label = active
+        .and_then(|download| download.item.as_ref())
+        .map_or_else(
+            || "Resolving download items".to_string(),
+            |item| {
+                format!(
+                    "{}/{} | {}",
+                    item.index,
+                    item.total,
+                    truncate_text(&item.title, 56)
+                )
+            },
+        );
     frame.render_widget(
-        Paragraph::new(format!("{platform} | {status_text}"))
+        Paragraph::new(format!("{platform} | {status_text}\n{item_label}"))
             .block(Block::default().title("Download").borders(Borders::ALL)),
         body[0],
     );
 
-    let percent = active
+    let item_percent = active
         .and_then(|download| download.progress.as_ref())
-        .map_or(0.0, |progress| progress.percent);
+        .map_or(0.0, |progress| progress.item_percent);
     frame.render_widget(
         Gauge::default()
-            .block(Block::default().borders(Borders::ALL))
+            .block(Block::default().title("Current item").borders(Borders::ALL))
             .gauge_style(Style::new().fg(Color::Green))
-            .percent(percent.round() as u16),
+            .percent(item_percent.round() as u16),
         body[1],
+    );
+
+    let overall_percent = active
+        .and_then(|download| download.progress.as_ref())
+        .map_or(0.0, |progress| progress.overall_percent);
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().title("Overall").borders(Borders::ALL))
+            .gauge_style(Style::new().fg(Color::Cyan))
+            .percent(overall_percent.round() as u16),
+        body[2],
     );
 
     let spinner = ["|", "/", "-", "\\"][spinner_index % 4];
@@ -316,29 +347,63 @@ fn render_download(frame: &mut Frame<'_>, active: Option<&ActiveDownload>, spinn
             || format!("{spinner} {status_text}"),
             |progress| {
                 format!(
-                    "{:.1}%  Speed: {}  ETA: {}",
-                    progress.percent, progress.speed, progress.eta
+                    "Item {:.1}% | Overall {:.1}% | Speed: {} | ETA: {}",
+                    progress.item_percent, progress.overall_percent, progress.speed, progress.eta
                 )
             },
         );
-    frame.render_widget(Paragraph::new(detail).alignment(Alignment::Center), body[2]);
+    frame.render_widget(Paragraph::new(detail).alignment(Alignment::Center), body[3]);
     render_footer(frame, chunks[2], "Esc: cancel download");
 }
 
 fn render_complete(frame: &mut Frame<'_>, state: &CompleteState) {
     let chunks = base_layout(frame.area());
     render_logo(frame, chunks[0]);
+    let mut lines = vec![
+        Line::from("Completed").centered().green().bold(),
+        Line::from(""),
+        Line::from(format!(
+            "Succeeded: {}  Failed: {}  Total: {}",
+            state.summary.succeeded.len(),
+            state.summary.failed.len(),
+            state.summary.total
+        ))
+        .centered(),
+    ];
+    for success in state.summary.succeeded.iter().take(3) {
+        lines.push(Line::from(format!(
+            "✓ {} → {}",
+            truncate_text(&success.item.title, 28),
+            truncate_text(&success.path, 42)
+        )));
+    }
+    for failure in state.summary.failed.iter().take(5) {
+        lines.push(
+            Line::from(format!(
+                "✗ {}: {}",
+                truncate_text(&failure.item.title, 30),
+                truncate_text(&failure.error, 44)
+            ))
+            .red(),
+        );
+    }
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from("Completed").centered().green().bold(),
-            Line::from(""),
-            Line::from(state.path.clone()).centered(),
-        ])
-        .block(Block::default().title("Done").borders(Borders::ALL))
-        .wrap(Wrap { trim: false }),
-        centered(chunks[1], 84, 9),
+        Paragraph::new(lines)
+            .block(Block::default().title("Done").borders(Borders::ALL))
+            .wrap(Wrap { trim: false }),
+        centered(chunks[1], 88, 14),
     );
     render_footer(frame, chunks[2], "Enter: new download  q: quit");
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 fn render_error(frame: &mut Frame<'_>, state: &ErrorState) {

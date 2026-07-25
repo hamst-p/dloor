@@ -12,7 +12,8 @@ pub mod platform;
 pub use config::{Browser, Config, Destination};
 pub use deps::{check_dependencies, DependencyReport, Tool};
 pub use download::{
-    parse_progress_line, DownloadEvent, DownloadJob, DownloadProgress, DownloadRequest, Format,
+    parse_progress_line, DownloadEvent, DownloadFailure, DownloadItem, DownloadJob,
+    DownloadProgress, DownloadRequest, DownloadSuccess, DownloadSummary, Format, PlaylistSelection,
     Quality,
 };
 pub use platform::{detect_platform, Platform};

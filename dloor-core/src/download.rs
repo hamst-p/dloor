@@ -54,30 +54,105 @@ pub struct DownloadRequest {
     pub url: String,
     pub format: Format,
     pub quality: Quality,
+    pub playlist: PlaylistSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaylistSelection {
+    Single,
+    All,
+    Item { index: usize },
 }
 
 #[derive(Debug, Clone)]
 pub struct DownloadProgress {
-    pub percent: f64,
+    pub item_percent: f64,
+    pub overall_percent: f64,
     pub speed: String,
     pub eta: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadItem {
+    pub index: usize,
+    pub total: usize,
+    pub title: String,
+    pub playlist_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadSuccess {
+    pub item: DownloadItem,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadFailure {
+    pub item: DownloadItem,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DownloadSummary {
+    pub total: usize,
+    pub succeeded: Vec<DownloadSuccess>,
+    pub failed: Vec<DownloadFailure>,
+}
+
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
-    Progress {
-        progress: DownloadProgress,
+    Resolving,
+    ItemStarted {
+        item: DownloadItem,
         platform: Platform,
     },
-    Converting,
-    Uploading,
-    Completed {
-        path: String,
+    Progress {
+        progress: DownloadProgress,
+        item: DownloadItem,
+        platform: Platform,
+    },
+    Converting {
+        item: DownloadItem,
+    },
+    Uploading {
+        item: DownloadItem,
+    },
+    ItemCompleted {
+        result: DownloadSuccess,
+    },
+    ItemFailed {
+        failure: DownloadFailure,
+    },
+    Finished {
+        summary: DownloadSummary,
     },
     Failed {
         error: String,
     },
-    Cancelled,
+    Cancelled {
+        summary: DownloadSummary,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedItem {
+    display: DownloadItem,
+    target: DownloadTarget,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DownloadTarget {
+    NoPlaylist,
+    PlaylistItem(usize),
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PlaylistEntry {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    playlist_index: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,16 +188,88 @@ impl DownloadJob {
 
     pub async fn run_with_sender(self, tx: &mpsc::Sender<DownloadEvent>) -> Result<()> {
         let platform = detect_platform(&self.request.url)?;
+        tx.send(DownloadEvent::Resolving).await.ok();
+        let items = self.resolve_items().await?;
+        let mut summary = DownloadSummary {
+            total: items.len(),
+            ..DownloadSummary::default()
+        };
+
+        for resolved in items {
+            if self.cancellation.is_cancelled() {
+                tx.send(DownloadEvent::Cancelled { summary }).await.ok();
+                return Ok(());
+            }
+            let item = resolved.display.clone();
+            tx.send(DownloadEvent::ItemStarted {
+                item: item.clone(),
+                platform,
+            })
+            .await
+            .ok();
+
+            match self
+                .run_item(
+                    &resolved,
+                    platform,
+                    summary.succeeded.len() + summary.failed.len(),
+                    tx,
+                )
+                .await
+            {
+                Ok(path) => {
+                    let result = DownloadSuccess { item, path };
+                    summary.succeeded.push(result.clone());
+                    tx.send(DownloadEvent::ItemCompleted { result }).await.ok();
+                }
+                Err(Error::Cancelled) => {
+                    tx.send(DownloadEvent::Cancelled { summary }).await.ok();
+                    return Ok(());
+                }
+                Err(error) => {
+                    let failure = DownloadFailure {
+                        item,
+                        error: error.to_string(),
+                    };
+                    summary.failed.push(failure.clone());
+                    tx.send(DownloadEvent::ItemFailed { failure }).await.ok();
+                }
+            }
+        }
+
+        tx.send(DownloadEvent::Finished { summary }).await.ok();
+        Ok(())
+    }
+
+    async fn run_item(
+        &self,
+        resolved: &ResolvedItem,
+        platform: Platform,
+        processed_items: usize,
+        tx: &mpsc::Sender<DownloadEvent>,
+    ) -> Result<String> {
         let (work_dir, _temp_guard) = self.prepare_work_dir().await?;
         let output_template = work_dir.join("%(title)s [%(id)s].%(ext)s");
-
-        let downloaded = self.run_ytdlp(&output_template, platform, tx).await?;
+        let downloaded = self
+            .run_ytdlp(
+                &output_template,
+                resolved.target,
+                resolved.display.clone(),
+                processed_items,
+                platform,
+                tx,
+            )
+            .await?;
         self.ensure_not_cancelled()?;
 
         let final_local = if self.request.format == Format::Video
             && self.request.quality == Quality::Compressed
         {
-            tx.send(DownloadEvent::Converting).await.ok();
+            tx.send(DownloadEvent::Converting {
+                item: resolved.display.clone(),
+            })
+            .await
+            .ok();
             transcode_video(&downloaded, &self.cancellation).await?
         } else {
             downloaded
@@ -137,7 +284,11 @@ impl DownloadJob {
                 destination.to_string_lossy().to_string()
             }
             Destination::Cloud { remote, path } => {
-                tx.send(DownloadEvent::Uploading).await.ok();
+                tx.send(DownloadEvent::Uploading {
+                    item: resolved.display.clone(),
+                })
+                .await
+                .ok();
                 upload_to_cloud(&final_local, remote, path, &self.cancellation).await?;
                 let file_name = final_local
                     .file_name()
@@ -147,14 +298,7 @@ impl DownloadJob {
             }
         };
         self.ensure_not_cancelled()?;
-
-        tx.send(DownloadEvent::Completed {
-            path: completed_path,
-        })
-        .await
-        .ok();
-
-        Ok(())
+        Ok(completed_path)
     }
 
     fn ensure_not_cancelled(&self) -> Result<()> {
@@ -175,11 +319,15 @@ impl DownloadJob {
     async fn run_ytdlp(
         &self,
         output_template: &Path,
+        target: DownloadTarget,
+        item: DownloadItem,
+        processed_items: usize,
         platform: Platform,
         tx: &mpsc::Sender<DownloadEvent>,
     ) -> Result<PathBuf> {
         let mut args = base_ytdlp_args(output_template, self.config.browser);
         args.extend(format_args(self.request.format, self.request.quality));
+        args.extend(download_target_args(target));
         args.push(OsString::from(&self.request.url));
 
         debug!(
@@ -237,7 +385,16 @@ impl DownloadJob {
                     match line? {
                         Some(line) => {
                             if let Some(progress) = progress_tracker.update(&line) {
-                                tx.send(DownloadEvent::Progress { progress, platform })
+                                let progress = with_overall_progress(
+                                    progress,
+                                    processed_items,
+                                    item.total,
+                                );
+                                tx.send(DownloadEvent::Progress {
+                                    progress,
+                                    item: item.clone(),
+                                    platform,
+                                })
                                     .await
                                     .ok();
                             } else {
@@ -273,12 +430,189 @@ impl DownloadJob {
         }
         Ok(output_path)
     }
+
+    async fn resolve_items(&self) -> Result<Vec<ResolvedItem>> {
+        match self.request.playlist {
+            PlaylistSelection::Single => {
+                match self
+                    .resolve_with_args(&["--no-playlist"], DownloadTarget::NoPlaylist)
+                    .await
+                {
+                    Ok(items) if !items.is_empty() => Ok(limit_and_number_items(items, 1)),
+                    Ok(_) | Err(Error::ProcessFailed(_)) | Err(Error::MissingOutputFile) => {
+                        self.ensure_not_cancelled()?;
+                        let items = self
+                            .resolve_with_args(
+                                &["--yes-playlist", "--playlist-end", "1"],
+                                DownloadTarget::PlaylistItem(1),
+                            )
+                            .await?;
+                        Ok(limit_and_number_items(items, 1))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            PlaylistSelection::All => {
+                let items = self
+                    .resolve_with_args(&["--yes-playlist"], DownloadTarget::PlaylistItem(1))
+                    .await?;
+                Ok(number_playlist_items(items))
+            }
+            PlaylistSelection::Item { index } => {
+                let index_text = index.to_string();
+                let items = self
+                    .resolve_with_args(
+                        &["--yes-playlist", "--playlist-items", &index_text],
+                        DownloadTarget::PlaylistItem(index),
+                    )
+                    .await?;
+                Ok(limit_and_number_items(items, 1))
+            }
+        }
+    }
+
+    async fn resolve_with_args(
+        &self,
+        selection_args: &[&str],
+        default_target: DownloadTarget,
+    ) -> Result<Vec<ResolvedItem>> {
+        let mut command = Command::new("yt-dlp");
+        command.args([
+            "--flat-playlist",
+            "--dump-json",
+            "--no-download",
+            "--ignore-errors",
+        ]);
+        command.args(selection_args);
+        if let Some(browser) = self.config.browser {
+            command.args(["--cookies-from-browser", browser.yt_dlp_name()]);
+        }
+        command.arg(&self.request.url);
+        command
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::ProcessFailed("failed to capture yt-dlp stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::ProcessFailed("failed to capture yt-dlp stderr".to_string()))?;
+        let stdout_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut values = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                values.push(line);
+            }
+            values
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            let mut values = Vec::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                values.push(line);
+            }
+            values.join("\n")
+        });
+        let status = tokio::select! {
+            _ = self.cancellation.cancelled() => {
+                child.kill().await.ok();
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                return Err(Error::Cancelled);
+            }
+            status = child.wait() => status?,
+        };
+        let stdout = stdout_task.await.unwrap_or_default();
+        let stderr = stderr_task.await.unwrap_or_default();
+        if !status.success() {
+            return Err(Error::ProcessFailed(if stderr.trim().is_empty() {
+                format!("yt-dlp metadata expansion exited with {status}")
+            } else {
+                stderr
+            }));
+        }
+        let entries = parse_playlist_entries(stdout.iter().map(String::as_str), default_target)?;
+        if entries.is_empty() {
+            return Err(Error::MissingOutputFile);
+        }
+        Ok(entries)
+    }
+}
+
+fn parse_playlist_entries<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    default_target: DownloadTarget,
+) -> Result<Vec<ResolvedItem>> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(position, line)| {
+            let entry: PlaylistEntry = serde_json::from_str(line).map_err(|_| {
+                Error::ProcessFailed("yt-dlp returned invalid metadata JSON".to_string())
+            })?;
+            let fallback_index = position + 1;
+            let playlist_index = entry.playlist_index.or(match default_target {
+                DownloadTarget::NoPlaylist => None,
+                DownloadTarget::PlaylistItem(index) => Some(index + position),
+            });
+            let target = match default_target {
+                DownloadTarget::NoPlaylist => DownloadTarget::NoPlaylist,
+                DownloadTarget::PlaylistItem(_) => {
+                    DownloadTarget::PlaylistItem(playlist_index.unwrap_or(fallback_index))
+                }
+            };
+            Ok(ResolvedItem {
+                display: DownloadItem {
+                    index: fallback_index,
+                    total: 0,
+                    title: entry
+                        .title
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or_else(|| format!("Item {fallback_index}")),
+                    playlist_index,
+                },
+                target,
+            })
+        })
+        .collect()
+}
+
+fn number_playlist_items(mut items: Vec<ResolvedItem>) -> Vec<ResolvedItem> {
+    let total = items.len();
+    for (position, item) in items.iter_mut().enumerate() {
+        item.display.index = position + 1;
+        item.display.total = total;
+    }
+    items
+}
+
+fn limit_and_number_items(mut items: Vec<ResolvedItem>, limit: usize) -> Vec<ResolvedItem> {
+    items.truncate(limit);
+    number_playlist_items(items)
+}
+
+fn with_overall_progress(
+    mut progress: DownloadProgress,
+    processed_items: usize,
+    total_items: usize,
+) -> DownloadProgress {
+    let total_items = total_items.max(1);
+    progress.overall_percent =
+        ((processed_items as f64 + progress.item_percent / 100.0) / total_items as f64 * 100.0)
+            .clamp(0.0, 100.0);
+    progress
 }
 
 fn terminal_event_for_error(error: Error) -> DownloadEvent {
     if matches!(error, Error::Cancelled) {
         debug!("download job cancelled");
-        DownloadEvent::Cancelled
+        DownloadEvent::Cancelled {
+            summary: DownloadSummary::default(),
+        }
     } else {
         error!(kind = error_kind(&error), "download job failed");
         DownloadEvent::Failed {
@@ -377,6 +711,17 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
     }
 }
 
+fn download_target_args(target: DownloadTarget) -> Vec<OsString> {
+    match target {
+        DownloadTarget::NoPlaylist => vec!["--no-playlist".into()],
+        DownloadTarget::PlaylistItem(index) => vec![
+            "--yes-playlist".into(),
+            "--playlist-items".into(),
+            index.max(1).to_string().into(),
+        ],
+    }
+}
+
 #[derive(Debug)]
 struct ParsedProgress {
     percent: Option<f64>,
@@ -385,7 +730,6 @@ struct ParsedProgress {
     fragment_index: Option<u64>,
     fragment_count: Option<u64>,
     playlist_index: Option<u64>,
-    n_entries: Option<u64>,
     format_id: String,
     speed: String,
     eta: String,
@@ -393,7 +737,6 @@ struct ParsedProgress {
 
 #[derive(Debug, Default)]
 struct ProgressPlan {
-    n_entries: Option<u64>,
     format_ids: Vec<String>,
     sizes: HashMap<String, u64>,
     downloaded: HashMap<String, u64>,
@@ -462,7 +805,7 @@ impl ProgressTracker {
         }
         .map(|fraction| fraction.clamp(0.0, 1.0))?;
 
-        let (item_fraction, planned_entries) = self.plans.get_mut(&playlist_index).map_or_else(
+        let item_fraction = self.plans.get_mut(&playlist_index).map_or_else(
             || {
                 let completed_parts = self
                     .completed_formats
@@ -470,10 +813,7 @@ impl ProgressTracker {
                     .filter(|(item, _)| *item == playlist_index)
                     .count()
                     .min(self.fallback_part_count - 1);
-                (
-                    (completed_parts as f64 + part_fraction) / self.fallback_part_count as f64,
-                    None,
-                )
+                (completed_parts as f64 + part_fraction) / self.fallback_part_count as f64
             },
             |plan| {
                 if let Some(total) = parsed.total_bytes.filter(|total| *total > 0) {
@@ -522,19 +862,16 @@ impl ProgressTracker {
                         .min(part_count - 1);
                     (completed_parts as f64 + part_fraction) / part_count as f64
                 };
-                (fraction, plan.n_entries)
+                fraction
             },
         );
-        let n_entries = parsed.n_entries.or(planned_entries);
-        let overall = n_entries
-            .filter(|total| *total > 0)
-            .map_or(item_fraction * 100.0, |total| {
-                ((playlist_index.saturating_sub(1) as f64 + item_fraction) / total as f64) * 100.0
-            });
-        self.max_percent = self.max_percent.max(overall.clamp(0.0, 100.0));
+        self.max_percent = self
+            .max_percent
+            .max((item_fraction * 100.0).clamp(0.0, 100.0));
 
         Some(DownloadProgress {
-            percent: self.max_percent,
+            item_percent: self.max_percent,
+            overall_percent: self.max_percent,
             speed: parsed.speed,
             eta: parsed.eta,
         })
@@ -555,7 +892,7 @@ fn parse_progress_fields(line: &str) -> Option<ParsedProgress> {
     let fragment_index = parse_optional_u64(parts.next()?);
     let fragment_count = parse_optional_u64(parts.next()?);
     let playlist_index = parse_optional_u64(parts.next()?);
-    let n_entries = parse_optional_u64(parts.next()?);
+    let _n_entries = parse_optional_u64(parts.next()?);
     let format_id = parts.next()?.to_string();
 
     Some(ParsedProgress {
@@ -565,7 +902,6 @@ fn parse_progress_fields(line: &str) -> Option<ParsedProgress> {
         fragment_index,
         fragment_count,
         playlist_index,
-        n_entries,
         format_id,
         speed: parts.next().unwrap_or("").to_string(),
         eta: parts.next().unwrap_or("").to_string(),
@@ -576,7 +912,7 @@ fn parse_plan_line(line: &str) -> Option<(u64, ProgressPlan)> {
     let line = line.strip_prefix(PLAN_PREFIX)?;
     let mut parts = line.splitn(8, '|').map(str::trim);
     let playlist_index = parse_optional_u64(parts.next()?).unwrap_or(1).max(1);
-    let n_entries = parse_optional_u64(parts.next()?);
+    let _n_entries = parse_optional_u64(parts.next()?);
     let format_id = parts.next()?;
     let format_size = parse_optional_u64(parts.next()?);
     let requested = [
@@ -603,7 +939,6 @@ fn parse_plan_line(line: &str) -> Option<(u64, ProgressPlan)> {
     Some((
         playlist_index,
         ProgressPlan {
-            n_entries,
             format_ids,
             sizes,
             downloaded: HashMap::new(),
@@ -750,7 +1085,8 @@ mod tests {
         let progress =
             parse_progress_line("DLOOR_PROGRESS|42.7%|427|1000|NA|NA|NA|NA|18|1.24MiB/s|00:18")
                 .unwrap();
-        assert!((progress.percent - 42.7).abs() < 1e-9);
+        assert!((progress.item_percent - 42.7).abs() < 1e-9);
+        assert!((progress.overall_percent - 42.7).abs() < 1e-9);
         assert_eq!(progress.speed, "1.24MiB/s");
         assert_eq!(progress.eta, "00:18");
     }
@@ -774,20 +1110,20 @@ mod tests {
             .update("DLOOR_PROGRESS|50%|50|100|NA|NA|NA|NA|140|1MiB/s|00:01")
             .unwrap();
 
-        assert!((video.percent - 90.909).abs() < 0.001);
-        assert_eq!(audio_start.percent, video.percent);
-        assert!((audio_half.percent - 95.454).abs() < 0.001);
+        assert!((video.item_percent - 90.909).abs() < 0.001);
+        assert_eq!(audio_start.item_percent, video.item_percent);
+        assert!((audio_half.item_percent - 95.454).abs() < 0.001);
     }
 
     #[test]
-    fn combines_playlist_and_format_progress() {
+    fn selected_playlist_item_progress_stays_item_local() {
         let mut tracker = ProgressTracker::new(2);
         tracker.update("DLOOR_PLAN|2|4|137+140|200|137|100|140|100");
         let progress = tracker
             .update("DLOOR_PROGRESS|50%|50|100|NA|NA|2|4|137|1MiB/s|00:01")
             .unwrap();
 
-        assert_eq!(progress.percent, 31.25);
+        assert_eq!(progress.item_percent, 25.0);
     }
 
     #[test]
@@ -801,8 +1137,8 @@ mod tests {
             .update("DLOOR_PROGRESS|50%|NA|NA|NA|NA|NA|NA|140|NA|NA")
             .unwrap();
 
-        assert_eq!(video.percent, 50.0);
-        assert_eq!(audio.percent, 75.0);
+        assert_eq!(video.item_percent, 50.0);
+        assert_eq!(audio.item_percent, 75.0);
     }
 
     #[test]
@@ -812,7 +1148,7 @@ mod tests {
             .update("DLOOR_PROGRESS|NA|NA|NA|3|12|NA|NA|hls|NA|NA")
             .unwrap();
 
-        assert_eq!(progress.percent, 25.0);
+        assert_eq!(progress.item_percent, 25.0);
     }
 
     #[test]
@@ -822,6 +1158,70 @@ mod tests {
         assert!(tracker
             .update("DLOOR_PROGRESS|NA|NA|NA|NA|NA|NA|NA|hls|NA|NA")
             .is_none());
+    }
+
+    #[test]
+    fn parses_and_numbers_playlist_entries() {
+        let entries = parse_playlist_entries(
+            [
+                r#"{"title":"First","playlist_index":4}"#,
+                r#"{"title":"Second","playlist_index":5}"#,
+            ],
+            DownloadTarget::PlaylistItem(1),
+        )
+        .unwrap();
+        let entries = number_playlist_items(entries);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].display.index, 1);
+        assert_eq!(entries[0].display.total, 2);
+        assert_eq!(entries[0].display.title, "First");
+        assert_eq!(entries[0].display.playlist_index, Some(4));
+        assert!(matches!(entries[1].target, DownloadTarget::PlaylistItem(5)));
+    }
+
+    #[test]
+    fn playlist_json_uses_a_safe_title_fallback() {
+        let entries = parse_playlist_entries(
+            [r#"{"title":"","playlist_index":1}"#],
+            DownloadTarget::PlaylistItem(1),
+        )
+        .unwrap();
+
+        assert_eq!(entries[0].display.title, "Item 1");
+    }
+
+    #[test]
+    fn playlist_overall_progress_includes_completed_items() {
+        let progress = with_overall_progress(
+            DownloadProgress {
+                item_percent: 50.0,
+                overall_percent: 50.0,
+                speed: String::new(),
+                eta: String::new(),
+            },
+            2,
+            4,
+        );
+
+        assert_eq!(progress.item_percent, 50.0);
+        assert_eq!(progress.overall_percent, 62.5);
+    }
+
+    #[test]
+    fn download_target_switches_playlist_flags() {
+        assert_eq!(
+            download_target_args(DownloadTarget::NoPlaylist),
+            [OsString::from("--no-playlist")]
+        );
+        assert_eq!(
+            download_target_args(DownloadTarget::PlaylistItem(7)),
+            [
+                OsString::from("--yes-playlist"),
+                OsString::from("--playlist-items"),
+                OsString::from("7"),
+            ]
+        );
     }
 
     #[test]
@@ -886,7 +1286,7 @@ mod tests {
     fn cancellation_maps_to_cancelled_terminal_event() {
         assert!(matches!(
             terminal_event_for_error(Error::Cancelled),
-            DownloadEvent::Cancelled
+            DownloadEvent::Cancelled { .. }
         ));
         assert!(matches!(
             terminal_event_for_error(Error::ProcessFailed("boom".to_string())),
@@ -901,6 +1301,7 @@ mod tests {
                 url: "https://example.com/video".to_string(),
                 format: Format::Video,
                 quality: Quality::Best,
+                playlist: PlaylistSelection::Single,
             },
             Config::default(),
         );
@@ -916,6 +1317,7 @@ mod tests {
                 url: "https://example.com/video".to_string(),
                 format: Format::Video,
                 quality: Quality::Best,
+                playlist: PlaylistSelection::Single,
             },
             Config::default(),
         );
