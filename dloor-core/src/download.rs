@@ -275,6 +275,7 @@ fn base_ytdlp_args(output_template: &Path, browser: Option<Browser>) -> Vec<OsSt
             "download:DLOOR_PROGRESS|%(progress._percent_str)s|",
             "%(progress.downloaded_bytes)s|",
             "%(progress.total_bytes,progress.total_bytes_estimate)s|",
+            "%(progress.fragment_index)s|%(progress.fragment_count)s|",
             "%(info.playlist_index)s|%(info.n_entries)s|%(info.format_id)s|",
             "%(progress._speed_str)s|%(progress._eta_str)s"
         )
@@ -338,9 +339,11 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
 
 #[derive(Debug)]
 struct ParsedProgress {
-    percent: f64,
+    percent: Option<f64>,
     downloaded_bytes: Option<u64>,
     total_bytes: Option<u64>,
+    fragment_index: Option<u64>,
+    fragment_count: Option<u64>,
     playlist_index: Option<u64>,
     n_entries: Option<u64>,
     format_id: String,
@@ -351,6 +354,7 @@ struct ParsedProgress {
 #[derive(Debug, Default)]
 struct ProgressPlan {
     n_entries: Option<u64>,
+    format_ids: Vec<String>,
     sizes: HashMap<String, u64>,
     downloaded: HashMap<String, u64>,
 }
@@ -409,13 +413,14 @@ impl ProgressTracker {
         self.last_playlist_index = Some(playlist_index);
         self.last_format_id = Some(parsed.format_id.clone());
 
-        let part_percent = match (parsed.downloaded_bytes, parsed.total_bytes) {
-            (Some(downloaded), Some(total)) if total > 0 => {
-                downloaded as f64 / total as f64 * 100.0
-            }
-            _ => parsed.percent,
+        let part_fraction = match (parsed.downloaded_bytes, parsed.total_bytes) {
+            (Some(downloaded), Some(total)) if total > 0 => Some(downloaded as f64 / total as f64),
+            _ => match (parsed.fragment_index, parsed.fragment_count) {
+                (Some(index), Some(count)) if count > 0 => Some(index as f64 / count as f64),
+                _ => parsed.percent.map(|percent| percent / 100.0),
+            },
         }
-        .clamp(0.0, 100.0);
+        .map(|fraction| fraction.clamp(0.0, 1.0))?;
 
         let (item_fraction, planned_entries) = self.plans.get_mut(&playlist_index).map_or_else(
             || {
@@ -426,8 +431,7 @@ impl ProgressTracker {
                     .count()
                     .min(self.fallback_part_count - 1);
                 (
-                    (completed_parts as f64 + part_percent / 100.0)
-                        / self.fallback_part_count as f64,
+                    (completed_parts as f64 + part_fraction) / self.fallback_part_count as f64,
                     None,
                 )
             },
@@ -438,22 +442,45 @@ impl ProgressTracker {
                 if let Some(downloaded) = parsed.downloaded_bytes {
                     plan.downloaded.insert(parsed.format_id.clone(), downloaded);
                 }
-                let total_bytes: u64 = plan.sizes.values().sum();
-                let downloaded_bytes: u64 = plan
-                    .sizes
-                    .iter()
-                    .map(|(format_id, total)| {
-                        plan.downloaded
-                            .get(format_id)
-                            .copied()
-                            .unwrap_or(0)
-                            .min(*total)
-                    })
-                    .sum();
-                let fraction = if total_bytes > 0 {
+                let all_sizes_known = !plan.format_ids.is_empty()
+                    && plan
+                        .format_ids
+                        .iter()
+                        .all(|format_id| plan.sizes.get(format_id).is_some_and(|size| *size > 0));
+                let fraction = if all_sizes_known {
+                    let total_bytes: u64 = plan
+                        .format_ids
+                        .iter()
+                        .filter_map(|format_id| plan.sizes.get(format_id))
+                        .sum();
+                    let downloaded_bytes: u64 = plan
+                        .format_ids
+                        .iter()
+                        .filter_map(|format_id| {
+                            let total = plan.sizes.get(format_id)?;
+                            Some(
+                                plan.downloaded
+                                    .get(format_id)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    .min(*total),
+                            )
+                        })
+                        .sum();
                     downloaded_bytes as f64 / total_bytes as f64
                 } else {
-                    part_percent / 100.0
+                    let part_count = plan.format_ids.len().max(self.fallback_part_count);
+                    let completed_parts = self
+                        .completed_formats
+                        .iter()
+                        .filter(|(item, format_id)| {
+                            *item == playlist_index
+                                && (plan.format_ids.is_empty()
+                                    || plan.format_ids.contains(format_id))
+                        })
+                        .count()
+                        .min(part_count - 1);
+                    (completed_parts as f64 + part_fraction) / part_count as f64
                 };
                 (fraction, plan.n_entries)
             },
@@ -476,15 +503,17 @@ impl ProgressTracker {
 
 fn parse_progress_fields(line: &str) -> Option<ParsedProgress> {
     let line = line.strip_prefix(PROGRESS_PREFIX)?;
-    let mut parts = line.splitn(8, '|').map(str::trim);
+    let mut parts = line.splitn(10, '|').map(str::trim);
     let percent = parts
         .next()?
         .trim_end_matches('%')
         .trim()
         .parse::<f64>()
-        .ok()?;
+        .ok();
     let downloaded_bytes = parse_optional_u64(parts.next()?);
     let total_bytes = parse_optional_u64(parts.next()?);
+    let fragment_index = parse_optional_u64(parts.next()?);
+    let fragment_count = parse_optional_u64(parts.next()?);
     let playlist_index = parse_optional_u64(parts.next()?);
     let n_entries = parse_optional_u64(parts.next()?);
     let format_id = parts.next()?.to_string();
@@ -493,6 +522,8 @@ fn parse_progress_fields(line: &str) -> Option<ParsedProgress> {
         percent,
         downloaded_bytes,
         total_bytes,
+        fragment_index,
+        fragment_count,
         playlist_index,
         n_entries,
         format_id,
@@ -512,15 +543,18 @@ fn parse_plan_line(line: &str) -> Option<(u64, ProgressPlan)> {
         (parts.next()?, parse_optional_u64(parts.next()?)),
         (parts.next()?, parse_optional_u64(parts.next()?)),
     ];
+    let mut format_ids = Vec::new();
     let mut sizes = HashMap::new();
     for (id, size) in requested {
         if id != "NA" && !id.is_empty() {
+            format_ids.push(id.to_string());
             if let Some(size) = size {
                 sizes.insert(id.to_string(), size);
             }
         }
     }
-    if sizes.is_empty() {
+    if format_ids.is_empty() {
+        format_ids.push(format_id.to_string());
         if let Some(size) = format_size {
             sizes.insert(format_id.to_string(), size);
         }
@@ -530,6 +564,7 @@ fn parse_plan_line(line: &str) -> Option<(u64, ProgressPlan)> {
         playlist_index,
         ProgressPlan {
             n_entries,
+            format_ids,
             sizes,
             downloaded: HashMap::new(),
         },
@@ -663,7 +698,8 @@ mod tests {
     #[test]
     fn parses_progress_template_output() {
         let progress =
-            parse_progress_line("DLOOR_PROGRESS|42.7%|427|1000|NA|NA|18|1.24MiB/s|00:18").unwrap();
+            parse_progress_line("DLOOR_PROGRESS|42.7%|427|1000|NA|NA|NA|NA|18|1.24MiB/s|00:18")
+                .unwrap();
         assert!((progress.percent - 42.7).abs() < 1e-9);
         assert_eq!(progress.speed, "1.24MiB/s");
         assert_eq!(progress.eta, "00:18");
@@ -679,13 +715,13 @@ mod tests {
         let mut tracker = ProgressTracker::new(2);
         tracker.update("DLOOR_PLAN|NA|NA|137+140|1100|137|1000|140|100");
         let video = tracker
-            .update("DLOOR_PROGRESS|100%|1000|1000|NA|NA|137|1MiB/s|00:00")
+            .update("DLOOR_PROGRESS|100%|1000|1000|NA|NA|NA|NA|137|1MiB/s|00:00")
             .unwrap();
         let audio_start = tracker
-            .update("DLOOR_PROGRESS|0%|0|100|NA|NA|140|1MiB/s|00:01")
+            .update("DLOOR_PROGRESS|0%|0|100|NA|NA|NA|NA|140|1MiB/s|00:01")
             .unwrap();
         let audio_half = tracker
-            .update("DLOOR_PROGRESS|50%|50|100|NA|NA|140|1MiB/s|00:01")
+            .update("DLOOR_PROGRESS|50%|50|100|NA|NA|NA|NA|140|1MiB/s|00:01")
             .unwrap();
 
         assert!((video.percent - 90.909).abs() < 0.001);
@@ -698,10 +734,44 @@ mod tests {
         let mut tracker = ProgressTracker::new(2);
         tracker.update("DLOOR_PLAN|2|4|137+140|200|137|100|140|100");
         let progress = tracker
-            .update("DLOOR_PROGRESS|50%|50|100|2|4|137|1MiB/s|00:01")
+            .update("DLOOR_PROGRESS|50%|50|100|NA|NA|2|4|137|1MiB/s|00:01")
             .unwrap();
 
         assert_eq!(progress.percent, 31.25);
+    }
+
+    #[test]
+    fn uses_equal_phases_until_every_format_size_is_known() {
+        let mut tracker = ProgressTracker::new(2);
+        tracker.update("DLOOR_PLAN|NA|NA|137+140|NA|137|1000|140|NA");
+        let video = tracker
+            .update("DLOOR_PROGRESS|100%|1000|1000|NA|NA|NA|NA|137|1MiB/s|00:00")
+            .unwrap();
+        let audio = tracker
+            .update("DLOOR_PROGRESS|50%|NA|NA|NA|NA|NA|NA|140|NA|NA")
+            .unwrap();
+
+        assert_eq!(video.percent, 50.0);
+        assert_eq!(audio.percent, 75.0);
+    }
+
+    #[test]
+    fn uses_fragment_progress_when_stream_size_and_percent_are_unknown() {
+        let mut tracker = ProgressTracker::new(1);
+        let progress = tracker
+            .update("DLOOR_PROGRESS|NA|NA|NA|3|12|NA|NA|hls|NA|NA")
+            .unwrap();
+
+        assert_eq!(progress.percent, 25.0);
+    }
+
+    #[test]
+    fn ignores_progress_when_no_numeric_measure_is_available() {
+        let mut tracker = ProgressTracker::new(1);
+
+        assert!(tracker
+            .update("DLOOR_PROGRESS|NA|NA|NA|NA|NA|NA|NA|hls|NA|NA")
+            .is_none());
     }
 
     #[test]
