@@ -4,7 +4,8 @@ use dloor_core::{
     check_dependencies, config::default_download_dir, detect_platform, Browser, Config,
     Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress, DownloadQueue,
     DownloadRequest, DownloadSummary, Format, HistoryEntry, HistoryStatus, HistoryStore, JobId,
-    Platform, PlaylistSelection, Quality, QueueStatus, DEFAULT_HISTORY_LIMIT,
+    MetadataJob, MetadataPreview, MetadataRequest, Platform, PlaylistSelection, Quality,
+    QueueStatus, DEFAULT_HISTORY_LIMIT,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -14,6 +15,8 @@ pub enum Screen {
     Setup(SetupState),
     Main(MainState),
     HowToUse,
+    PreviewLoading(PreviewLoadingState),
+    Preview(PreviewState),
     Playlist(PlaylistState),
     Format(FormatState),
     Quality(QualityState),
@@ -30,9 +33,21 @@ pub struct MainState {
     pub url_input: String,
 }
 
+#[derive(Debug, Default)]
+pub struct PreviewLoadingState {
+    pub cancelling: bool,
+}
+
+#[derive(Debug)]
+pub struct PreviewState {
+    pub url: String,
+    pub preview: MetadataPreview,
+}
+
 #[derive(Debug)]
 pub struct FormatState {
     pub url: String,
+    pub title: String,
     pub playlist: PlaylistSelection,
     pub selected: usize,
 }
@@ -40,12 +55,14 @@ pub struct FormatState {
 #[derive(Debug)]
 pub struct PlaylistState {
     pub url: String,
+    pub title: String,
     pub selected: usize,
 }
 
 #[derive(Debug)]
 pub struct QualityState {
     pub url: String,
+    pub title: String,
     pub playlist: PlaylistSelection,
     pub format: Format,
     pub selected: usize,
@@ -112,6 +129,7 @@ pub struct SharedState {
     pub queue: DownloadQueue,
     pub history: HistoryStore,
     pub active_download: Option<ActiveDownload>,
+    pub active_preview: Option<ActivePreview>,
     pub notification: Option<String>,
     startup_error: Option<String>,
 }
@@ -124,6 +142,13 @@ pub struct ActiveDownload {
     pub item: Option<DownloadItem>,
     pub progress: Option<DownloadProgress>,
     pub status_text: String,
+    receiver: mpsc::Receiver<DownloadEvent>,
+    cancellation: CancellationToken,
+}
+
+#[derive(Debug)]
+pub struct ActivePreview {
+    url: String,
     receiver: mpsc::Receiver<DownloadEvent>,
     cancellation: CancellationToken,
 }
@@ -150,6 +175,13 @@ enum DownloadTerminal {
     Finished(JobId, DownloadSummary),
     Failed(JobId, String),
     Cancelled(JobId, DownloadSummary),
+}
+
+#[derive(Debug)]
+enum PreviewTerminal {
+    Ready(String, MetadataPreview),
+    Failed(String),
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -185,6 +217,7 @@ impl App {
                 queue: DownloadQueue::new(),
                 history,
                 active_download: None,
+                active_preview: None,
                 notification: None,
                 startup_error,
             },
@@ -198,6 +231,22 @@ impl App {
 
     pub fn tick(&mut self) {
         self.shared.spinner_index = self.shared.spinner_index.wrapping_add(1);
+        let preview_terminal = self.shared.poll_preview();
+        match preview_terminal {
+            Some(PreviewTerminal::Ready(url, preview)) => {
+                if matches!(self.navigation.current, Screen::PreviewLoading(_)) {
+                    self.navigation
+                        .replace(Screen::Preview(PreviewState { url, preview }));
+                }
+            }
+            Some(PreviewTerminal::Failed(error)) => self.navigation.show_error(error),
+            Some(PreviewTerminal::Cancelled) => {
+                if matches!(self.navigation.current, Screen::PreviewLoading(_)) {
+                    self.navigation.back();
+                }
+            }
+            None => {}
+        }
         let monitored_job = match &self.navigation.current {
             Screen::Download(state) => Some(state.job_id),
             _ => None,
@@ -250,6 +299,10 @@ impl App {
             Screen::Setup(state) => handle_setup_key(state, &mut self.shared, key),
             Screen::Main(state) => handle_main_key(state, &mut self.shared, key),
             Screen::HowToUse => handle_how_to_use_key(key),
+            Screen::PreviewLoading(state) => {
+                handle_preview_loading_key(state, &mut self.shared, key)
+            }
+            Screen::Preview(state) => handle_preview_key(state, key),
             Screen::Playlist(state) => handle_playlist_key(state, key),
             Screen::Format(state) => handle_format_key(state, &self.shared, key),
             Screen::Quality(state) => handle_quality_key(state, &mut self.shared, key),
@@ -302,6 +355,40 @@ impl App {
 }
 
 impl SharedState {
+    fn start_preview(&mut self, url: String) {
+        let job = MetadataJob::new(MetadataRequest {
+            url: url.clone(),
+            browser: self.config.browser,
+        });
+        let cancellation = job.cancellation_token();
+        self.active_preview = Some(ActivePreview {
+            url,
+            receiver: job.spawn(),
+            cancellation,
+        });
+    }
+
+    fn poll_preview(&mut self) -> Option<PreviewTerminal> {
+        let active = self.active_preview.as_mut()?;
+        let event = active.receiver.try_recv().ok()?;
+        let terminal = match event {
+            DownloadEvent::PreviewReady { preview } => {
+                PreviewTerminal::Ready(active.url.clone(), preview)
+            }
+            DownloadEvent::PreviewFailed { error } => PreviewTerminal::Failed(error),
+            DownloadEvent::PreviewCancelled => PreviewTerminal::Cancelled,
+            _ => return None,
+        };
+        self.active_preview = None;
+        Some(terminal)
+    }
+
+    fn cancel_preview(&mut self) {
+        if let Some(active) = &self.active_preview {
+            active.cancellation.cancel();
+        }
+    }
+
     fn enqueue(&mut self, request: DownloadRequest, title: String) -> JobId {
         let platform = detect_platform(&request.url).expect("validated URL is queued");
         let id = self.queue.enqueue(request, title, platform);
@@ -316,6 +403,9 @@ impl SharedState {
                 self.queue.apply_event(active.job_id, &event);
                 self.record_event(&active, &event);
                 match event {
+                    DownloadEvent::PreviewReady { .. }
+                    | DownloadEvent::PreviewFailed { .. }
+                    | DownloadEvent::PreviewCancelled => {}
                     DownloadEvent::Resolving => {
                         active.status_text = "Resolving items...".to_string();
                     }
@@ -442,7 +532,10 @@ impl SharedState {
                     HistoryStatus::Cancelled,
                 )),
             },
-            DownloadEvent::Resolving
+            DownloadEvent::PreviewReady { .. }
+            | DownloadEvent::PreviewFailed { .. }
+            | DownloadEvent::PreviewCancelled
+            | DownloadEvent::Resolving
             | DownloadEvent::ItemStarted { .. }
             | DownloadEvent::Progress { .. }
             | DownloadEvent::Converting { .. }
@@ -477,6 +570,7 @@ impl SharedState {
     }
 
     fn cancel_all(&mut self) {
+        self.cancel_preview();
         if let Some(active) = &mut self.active_download {
             active.cancellation.cancel();
             let title = active
@@ -635,10 +729,10 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
                 return Transition::Push(Screen::History(HistoryState::default()));
             }
             match detect_platform(&input) {
-                Ok(_) => Transition::Push(Screen::Playlist(PlaylistState {
-                    url: input,
-                    selected: 0,
-                })),
+                Ok(_) => {
+                    shared.start_preview(input);
+                    Transition::Push(Screen::PreviewLoading(PreviewLoadingState::default()))
+                }
                 Err(error) => Transition::ShowError(error.to_string()),
             }
         }
@@ -662,6 +756,38 @@ fn handle_how_to_use_key(key: KeyEvent) -> Transition {
     }
 }
 
+fn handle_preview_loading_key(
+    state: &mut PreviewLoadingState,
+    shared: &mut SharedState,
+    key: KeyEvent,
+) -> Transition {
+    if key.code == KeyCode::Esc {
+        state.cancelling = true;
+        shared.cancel_preview();
+    }
+    Transition::Stay
+}
+
+fn handle_preview_key(state: &PreviewState, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Esc => Transition::Back,
+        KeyCode::Enter if state.preview.playlist.is_some() => {
+            Transition::Push(Screen::Playlist(PlaylistState {
+                url: state.url.clone(),
+                title: state.preview.title.clone(),
+                selected: 0,
+            }))
+        }
+        KeyCode::Enter => Transition::Push(Screen::Format(FormatState {
+            url: state.url.clone(),
+            title: state.preview.title.clone(),
+            playlist: PlaylistSelection::Single,
+            selected: 0,
+        })),
+        _ => Transition::Stay,
+    }
+}
+
 fn handle_playlist_key(state: &mut PlaylistState, key: KeyEvent) -> Transition {
     match key.code {
         KeyCode::Esc => return Transition::Back,
@@ -670,6 +796,7 @@ fn handle_playlist_key(state: &mut PlaylistState, key: KeyEvent) -> Transition {
         KeyCode::Enter => {
             return Transition::Push(Screen::Format(FormatState {
                 url: state.url.clone(),
+                title: state.title.clone(),
                 playlist: if state.selected == 0 {
                     PlaylistSelection::Single
                 } else {
@@ -691,6 +818,7 @@ fn handle_format_key(state: &mut FormatState, shared: &SharedState, key: KeyEven
         KeyCode::Enter => {
             return Transition::Push(Screen::Quality(QualityState {
                 url: state.url.clone(),
+                title: state.title.clone(),
                 playlist: state.playlist,
                 format: if state.selected == 0 {
                     Format::Video
@@ -725,7 +853,7 @@ fn handle_quality_key(
                 },
                 playlist: state.playlist,
             };
-            shared.enqueue(request, state.url.clone());
+            shared.enqueue(request, state.title.clone());
             return Transition::ReturnToMain { clear_input: true };
         }
         _ => {}
@@ -985,6 +1113,7 @@ mod tests {
     fn format_screen() -> Screen {
         Screen::Format(FormatState {
             url: "https://youtube.com/watch?v=example".to_string(),
+            title: "Example".to_string(),
             playlist: PlaylistSelection::Single,
             selected: 0,
         })
@@ -993,6 +1122,7 @@ mod tests {
     fn quality_screen() -> Screen {
         Screen::Quality(QualityState {
             url: "https://youtube.com/watch?v=example".to_string(),
+            title: "Example".to_string(),
             playlist: PlaylistSelection::Single,
             format: Format::Video,
             selected: 0,
@@ -1010,6 +1140,7 @@ mod tests {
             queue: DownloadQueue::new(),
             history,
             active_download: None,
+            active_preview: None,
             notification: None,
             startup_error: None,
         }

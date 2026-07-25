@@ -8,6 +8,7 @@ pub mod config;
 pub mod deps;
 pub mod download;
 pub mod history;
+pub mod metadata;
 pub mod platform;
 pub mod queue;
 
@@ -19,6 +20,10 @@ pub use download::{
     Quality,
 };
 pub use history::{HistoryEntry, HistoryStatus, HistoryStore, DEFAULT_HISTORY_LIMIT};
+pub use metadata::{
+    parse_metadata_json, MetadataJob, MetadataPreview, MetadataRequest, PlaylistPreview,
+    PREVIEW_ITEM_LIMIT,
+};
 pub use platform::{detect_platform, Platform};
 pub use queue::{DownloadQueue, JobId, QueueStatus, QueuedJob};
 

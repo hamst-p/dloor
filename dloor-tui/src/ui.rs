@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    ActiveDownload, App, CompleteState, ErrorState, HistoryState, MainState, QueueState, Screen,
-    SetupField, SetupState, SharedState,
+    ActiveDownload, App, CompleteState, ErrorState, HistoryState, MainState, PreviewLoadingState,
+    PreviewState, QueueState, Screen, SetupField, SetupState, SharedState,
 };
 
 const LOGO: &str = r"
@@ -30,6 +30,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         ),
         Screen::Main(state) => render_main(frame, state, &app.shared),
         Screen::HowToUse => render_how_to_use(frame),
+        Screen::PreviewLoading(state) => {
+            render_preview_loading(frame, state, app.shared.spinner_index)
+        }
+        Screen::Preview(state) => render_preview(frame, state),
         Screen::Playlist(state) => render_choice(
             frame,
             "Download scope",
@@ -248,14 +252,108 @@ fn render_how_to_use(frame: &mut Frame<'_>) {
         Paragraph::new(vec![
             Line::from("how to use:").centered(),
             Line::from("1. input URL (URL auto detect)").centered(),
-            Line::from("2. select format & quality").centered(),
-            Line::from("3. done, enjoy!").centered(),
+            Line::from("2. review metadata and choose scope").centered(),
+            Line::from("3. select format & quality to enqueue").centered(),
             Line::from(""),
             Line::from("Enter to exit").centered().fg(Color::DarkGray),
         ])
         .alignment(Alignment::Center),
         area,
     );
+}
+
+fn render_preview_loading(
+    frame: &mut Frame<'_>,
+    state: &PreviewLoadingState,
+    spinner_index: usize,
+) {
+    let chunks = base_layout(frame.area());
+    render_logo(frame, chunks[0]);
+    let spinner = ["|", "/", "-", "\\"][spinner_index % 4];
+    let message = if state.cancelling {
+        format!("{spinner} Cancelling metadata preview...")
+    } else {
+        format!("{spinner} Loading metadata preview...")
+    };
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .block(Block::default().title("Preview").borders(Borders::ALL)),
+        centered(chunks[1], 72, 7),
+    );
+    render_footer(frame, chunks[2], "Esc: cancel preview");
+}
+
+fn render_preview(frame: &mut Frame<'_>, state: &PreviewState) {
+    let chunks = base_layout(frame.area());
+    render_logo(frame, chunks[0]);
+    let preview = &state.preview;
+    let mut lines = vec![
+        field_line("Title", &preview.title, false),
+        field_line(
+            "Uploader",
+            preview.uploader.as_deref().unwrap_or("Unknown"),
+            false,
+        ),
+        field_line(
+            "Duration",
+            &preview
+                .duration_seconds
+                .map_or_else(|| "Unknown".to_string(), format_duration),
+            false,
+        ),
+        field_line(
+            "Resolutions",
+            &if preview.resolutions.is_empty() {
+                "Not reported".to_string()
+            } else {
+                preview.resolutions.join(", ")
+            },
+            false,
+        ),
+    ];
+    if let Some(playlist) = &preview.playlist {
+        lines.push(Line::from(""));
+        lines.push(field_line(
+            "Playlist items",
+            &playlist
+                .total_items
+                .map_or_else(|| "At least 5".to_string(), |total| total.to_string()),
+            false,
+        ));
+        for (index, title) in playlist.sample_titles.iter().enumerate() {
+            lines.push(Line::from(format!(
+                "  {}. {}",
+                index + 1,
+                truncate_text(title, 68)
+            )));
+        }
+        if playlist.truncated {
+            lines.push(Line::from("  …more items are not fetched for preview").dark_gray());
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Metadata preview")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        centered(chunks[1], 88, 17),
+    );
+    render_footer(frame, chunks[2], "Enter: continue  Esc: back");
+}
+
+fn format_duration(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
 }
 
 fn render_choice(frame: &mut Frame<'_>, title: &str, options: &[&str], selected: usize) {

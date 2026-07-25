@@ -126,7 +126,10 @@ impl DownloadQueue {
                 self.active = None;
                 return true;
             }
-            DownloadEvent::Resolving
+            DownloadEvent::PreviewReady { .. }
+            | DownloadEvent::PreviewFailed { .. }
+            | DownloadEvent::PreviewCancelled
+            | DownloadEvent::Resolving
             | DownloadEvent::Converting { .. }
             | DownloadEvent::Uploading { .. }
             | DownloadEvent::ItemCompleted { .. }

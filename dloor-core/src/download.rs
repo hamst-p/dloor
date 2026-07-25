@@ -16,7 +16,7 @@ use tracing::{debug, error};
 
 use crate::{
     config::{Browser, Config, Destination},
-    detect_platform, Error, Platform, Result,
+    detect_platform, Error, MetadataPreview, Platform, Result,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -102,6 +102,13 @@ pub struct DownloadSummary {
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
+    PreviewReady {
+        preview: MetadataPreview,
+    },
+    PreviewFailed {
+        error: String,
+    },
+    PreviewCancelled,
     Resolving,
     ItemStarted {
         item: DownloadItem,

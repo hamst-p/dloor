@@ -25,6 +25,8 @@ dloor is early-stage OSS software. The local download flow is the primary suppor
 ## Features
 
 - Download a single authorized media item as video or audio
+- Preview title, uploader, duration, and reported resolutions before enqueueing
+- Preview a playlist's total count and first five titles without fetching every item
 - Expand an authorized playlist and process its items sequentially
 - Continue a playlist after individual item failures and report a final summary
 - Show separate current-item and overall playlist progress
@@ -175,12 +177,14 @@ Then enter the remote name and remote path in dloor's setup screen.
 
 1. Paste a supported URL into the main screen.
 2. Press `Enter`.
-3. Choose whether to download one item or the entire playlist.
-4. Choose `Video` or `Audio`.
-5. Choose `Best` or `Compressed`.
-6. The job is added to the queue and the main screen is ready for another URL.
-7. Open `/queue` to monitor current-item and overall progress.
-8. Open `/history` to review saved paths, failures, or retry a failed item.
+3. Wait for the cancellable metadata preview and verify the title, uploader,
+   duration, resolutions, and playlist sample.
+4. For a playlist, choose whether to download one item or the entire playlist.
+5. Choose `Video` or `Audio`.
+6. Choose `Best` or `Compressed`.
+7. The job is added to the queue and the main screen is ready for another URL.
+8. Open `/queue` to monitor current-item and overall progress.
+9. Open `/history` to review saved paths, failures, or retry a failed item.
 
 ## Key Commands
 
@@ -192,6 +196,7 @@ Then enter the remote name and remote path in dloor's setup screen.
 - `/quit`: quit
 - `q`: quit from the URL input or completion screen
 - `Esc`: go back, or quit from the URL input screen
+- `Esc` while metadata is loading: cancel the preview request
 - `Esc` during a download: cancel the active `yt-dlp`, `ffmpeg`, or `rclone` process
 - Arrow keys: move between scope, format, and quality choices
 - Queue screen `Ctrl+Up` / `Ctrl+Down`: reorder a waiting job
@@ -225,6 +230,10 @@ The `default_quality` value controls the initial selection on each Quality scree
 ```toml
 default_quality = "Compressed"
 ```
+
+Metadata previews use the same optional browser authentication setting as the
+eventual download. Playlist previews are limited to the first five entries;
+this limit is fixed and does not add a `config.toml` field.
 
 Runtime diagnostics are written to `dloor.log` beside `config.toml`. The file is
 limited to 5 MiB and one `dloor.log.1` backup is retained. Set `RUST_LOG` when
