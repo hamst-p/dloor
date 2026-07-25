@@ -223,6 +223,11 @@ impl DownloadJob {
                         Some(line) => {
                             if let Some(path) = parse_output_line(&line) {
                                 output_path = Some(path);
+                            } else {
+                                // before_dl planning records share stdout with the
+                                // after_move record, but are unambiguously prefixed.
+                                // Actual progress records are read only from stderr.
+                                progress_tracker.update(&line);
                             }
                         }
                         None => stdout_open = false,
