@@ -89,9 +89,9 @@ Tagged releases provide archives for:
 
 Download the archive for your platform from
 [GitHub Releases](https://github.com/hamst-p/dloor/releases), verify it against
-the accompanying `SHA256SUMS`, extract it, and move `dloor` to a directory on
-your `PATH`. The archive does not bundle `yt-dlp`, `ffmpeg`, or `rclone`; install
-those separately as described under Requirements.
+the accompanying `SHA256SUMS`, extract it, and move `dloor` and/or `dloor-cli`
+to a directory on your `PATH`. The archive does not bundle `yt-dlp`, `ffmpeg`,
+or `rclone`; install those separately as described under Requirements.
 
 Windows is not a supported release target in this phase. The Rust UI stack is
 portable, but process cancellation, updater/package-manager guidance, filesystem
@@ -105,6 +105,7 @@ If Rust is already installed, you can install directly from the repository:
 
 ```bash
 cargo install --git https://github.com/hamst-p/dloor.git --package dloor-tui --bin dloor
+cargo install --git https://github.com/hamst-p/dloor.git --package dloor-cli --bin dloor-cli
 dloor
 ```
 
@@ -117,6 +118,7 @@ git clone https://github.com/hamst-p/dloor.git
 cd dloor
 cargo build --release
 ./target/release/dloor
+./target/release/dloor-cli --help
 ```
 
 For day-to-day development:
@@ -229,6 +231,33 @@ Then enter the remote name and remote path in dloor's setup screen.
 9. Open `/queue` to monitor current-item and overall progress.
 10. Open `/history` to review saved paths, failures, or retry a failed item.
 
+### Non-interactive CLI
+
+`dloor-cli` runs the same `dloor-core` download job without opening the TUI:
+
+```bash
+dloor-cli \
+  --format video \
+  --quality best \
+  --output "$HOME/Downloads" \
+  "https://www.youtube.com/watch?v=EXAMPLE"
+```
+
+Pass more than one URL to process them sequentially, and add `--playlist` to
+expand each playlist. Valid URLs on hosts that dloor does not recognize require
+the explicit `--allow-generic` flag; the TUI's remembered confirmation setting
+does not silently opt a script into unverified hosts.
+
+Successful final paths are written one per line to stdout. Diagnostics,
+warnings, and interactive progress use stderr; progress is suppressed unless
+both streams are terminals, so stdout remains safe to pipe. `--json` replaces
+the path lines with one versioned JSON document and suppresses progress.
+
+The CLI returns `0` only when every item succeeds, `1` for execution or partial
+failure, `2` for invalid arguments, and `130` after Ctrl-C has cancelled the
+active child process. Individual URL failures do not prevent later URLs from
+running.
+
 ## Key Commands
 
 - URL input: paste a URL and press `Enter`
@@ -276,6 +305,13 @@ request, the completion screen reports the selected height as a warning.
 ## Configuration
 
 Configuration is stored as `config.toml` in the operating system's standard config directory, resolved through the `directories` crate.
+
+The TUI and CLI share this file by default, including cookies, media embedding,
+bandwidth, default quality, and transcode settings. CLI flags override the
+matching setting, and `--output` always selects a local destination so a script
+cannot upload merely because the TUI was configured for cloud storage. Use
+`--no-config` for deterministic built-in defaults or `--config <FILE>` for an
+explicit file. CLI runs do not write the TUI download history.
 
 Typical locations:
 
@@ -498,6 +534,7 @@ Project layout:
 
 - `dloor-core`: UI-independent core library for platform detection, configuration, dependency checks, and download jobs
 - `dloor-tui`: Ratatui / crossterm terminal frontend
+- `dloor-cli`: non-interactive, pipe-friendly frontend using the same core event stream
 - `.github/workflows`: pull-request checks and tagged native-release automation
 
 The core download logic is intentionally separated from the TUI. Future chat integrations, such as Telegram or Slack agents, can reuse `dloor-core` by subscribing to the same `DownloadEvent` stream.
