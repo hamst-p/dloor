@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    ActiveDownload, App, CompleteState, ErrorState, HistoryState, MainState, PreviewLoadingState,
-    PreviewState, QueueState, Screen, SetupField, SetupState, SharedState,
+    ActiveDownload, App, CompleteState, ErrorState, GenericConfirmState, HistoryState, MainState,
+    PreviewLoadingState, PreviewState, QueueState, Screen, SetupField, SetupState, SharedState,
 };
 
 const LOGO: &str = r"
@@ -34,6 +34,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             render_preview_loading(frame, state, app.shared.spinner_index)
         }
         Screen::Preview(state) => render_preview(frame, state),
+        Screen::GenericConfirm(state) => render_generic_confirm(frame, state),
         Screen::Playlist(state) => render_choice(
             frame,
             "Download scope",
@@ -172,12 +173,22 @@ fn render_setup(
         "dloor passes the selection to yt-dlp and never logs cookie paths or contents.",
         Style::new().fg(Color::DarkGray),
     )));
+    lines.push(Line::from(""));
+    lines.push(field_line(
+        "Confirm generic URLs",
+        if state.confirm_generic_urls {
+            "Always"
+        } else {
+            "Do not ask"
+        },
+        state.field == SetupField::GenericConfirmation,
+    ));
 
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        centered(chunks[1], 88, 18),
+        centered(chunks[1], 88, 20),
     );
     render_footer(frame, chunks[2], "Tab: next field  Enter: save  Esc: back");
 }
@@ -353,6 +364,32 @@ fn render_preview(frame: &mut Frame<'_>, state: &PreviewState) {
         centered(chunks[1], 88, 17),
     );
     render_footer(frame, chunks[2], "Enter: continue  Esc: back");
+}
+
+fn render_generic_confirm(frame: &mut Frame<'_>, state: &GenericConfirmState) {
+    let area = centered(frame.area(), 78, 11);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("This host is not in dloor's tested platform list.").yellow(),
+            Line::from(""),
+            Line::from("The URL is syntactically valid and can be passed to yt-dlp,"),
+            Line::from("but compatibility and output are not guaranteed."),
+            Line::from(""),
+            Line::from(truncate_text(&state.url, 68)).dark_gray(),
+            Line::from(""),
+            Line::from("Enter: continue once   a: continue and do not ask again   Esc: cancel")
+                .dark_gray(),
+        ])
+        .block(
+            Block::default()
+                .title("Unverified host")
+                .borders(Borders::ALL),
+        )
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn format_duration(seconds: u64) -> String {

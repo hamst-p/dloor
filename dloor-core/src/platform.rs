@@ -1,5 +1,3 @@
-use regex::Regex;
-
 use crate::{Error, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -11,6 +9,7 @@ pub enum Platform {
     TikTok,
     Facebook,
     X,
+    Generic,
 }
 
 impl Platform {
@@ -23,25 +22,47 @@ impl Platform {
             Self::TikTok => "TikTok",
             Self::Facebook => "Facebook",
             Self::X => "X (Twitter)",
+            Self::Generic => "Generic (yt-dlp)",
         }
     }
 }
 
 pub fn detect_platform(url: &str) -> Result<Platform> {
     let trimmed = url.trim();
-    let capture = Regex::new(r"(?i)^(?:https?://)?(?:www\.)?([^/?#]+)([^?#]*)")
-        .expect("platform URL regex compiles")
-        .captures(trimmed)
+    let (scheme, remainder) = trimmed
+        .split_once("://")
         .ok_or_else(|| Error::UnsupportedUrl(trimmed.to_string()))?;
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+        || trimmed.chars().any(|character| {
+            character.is_control()
+                || character.is_whitespace()
+                || matches!(
+                    character,
+                    '\\' | '`' | '$' | ';' | '|' | '<' | '>' | '"' | '\''
+                )
+        })
+    {
+        return Err(Error::UnsupportedUrl(trimmed.to_string()));
+    }
 
-    let host = capture
-        .get(1)
-        .map(|m| m.as_str().to_ascii_lowercase())
-        .unwrap_or_default();
-    let path = capture
-        .get(2)
-        .map(|m| m.as_str().to_ascii_lowercase())
-        .unwrap_or_default();
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty() || authority.contains('@') || !valid_authority(authority) {
+        return Err(Error::UnsupportedUrl(trimmed.to_string()));
+    }
+
+    let authority_lower = authority.to_ascii_lowercase();
+    let host = authority_lower
+        .trim_start_matches("www.")
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let path = remainder[authority_end..]
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
 
     match host.as_str() {
         "youtube.com" | "m.youtube.com" | "music.youtube.com" => {
@@ -62,8 +83,35 @@ pub fn detect_platform(url: &str) -> Result<Platform> {
         "tiktok.com" | "m.tiktok.com" | "vt.tiktok.com" | "vm.tiktok.com" => Ok(Platform::TikTok),
         "facebook.com" | "m.facebook.com" | "fb.watch" => Ok(Platform::Facebook),
         "x.com" | "twitter.com" | "mobile.twitter.com" | "t.co" => Ok(Platform::X),
-        _ => Err(Error::UnsupportedUrl(trimmed.to_string())),
+        _ => Ok(Platform::Generic),
     }
+}
+
+fn valid_authority(authority: &str) -> bool {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => {
+            (host, Some(port))
+        }
+        Some(_) => return false,
+        None => (authority, None),
+    };
+    if port.is_some_and(|port| port.parse::<u16>().map_or(true, |value| value == 0)) {
+        return false;
+    }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return true;
+    }
+    !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+                && label.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+                && label.ends_with(|ch: char| ch.is_ascii_alphanumeric())
+        })
 }
 
 #[cfg(test)]
@@ -90,7 +138,30 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_urls() {
-        assert!(detect_platform("https://example.com/video").is_err());
+    fn unknown_valid_hosts_are_generic() {
+        assert_eq!(
+            detect_platform("https://example.com/video?id=1").unwrap(),
+            Platform::Generic
+        );
+        assert_eq!(
+            detect_platform("http://127.0.0.1:8080/video").unwrap(),
+            Platform::Generic
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_command_like_inputs() {
+        for value in [
+            "youtube.com/watch?v=abc",
+            "file:///tmp/video",
+            "https:///missing-host",
+            "https://bad host/video",
+            "https://example.com/video;rm",
+            "https://user@example.com/video",
+            "--exec=command",
+            "https://example.com:99999/video",
+        ] {
+            assert!(detect_platform(value).is_err(), "{value}");
+        }
     }
 }

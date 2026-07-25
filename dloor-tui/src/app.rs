@@ -17,6 +17,7 @@ pub enum Screen {
     HowToUse,
     PreviewLoading(PreviewLoadingState),
     Preview(PreviewState),
+    GenericConfirm(GenericConfirmState),
     Playlist(PlaylistState),
     Format(FormatState),
     Quality(QualityState),
@@ -42,6 +43,11 @@ pub struct PreviewLoadingState {
 pub struct PreviewState {
     pub url: String,
     pub preview: MetadataPreview,
+}
+
+#[derive(Debug)]
+pub struct GenericConfirmState {
+    pub url: String,
 }
 
 #[derive(Debug)]
@@ -108,6 +114,7 @@ pub enum SetupField {
     CookieSource,
     Browser,
     CookieFile,
+    GenericConfirmation,
 }
 
 #[derive(Debug)]
@@ -120,6 +127,7 @@ pub struct SetupState {
     pub cookie_source_index: usize,
     pub browser_index: usize,
     pub cookie_file_path: String,
+    pub confirm_generic_urls: bool,
 }
 
 #[derive(Debug)]
@@ -305,6 +313,9 @@ impl App {
                 handle_preview_loading_key(state, &mut self.shared, key)
             }
             Screen::Preview(state) => handle_preview_key(state, key),
+            Screen::GenericConfirm(state) => {
+                handle_generic_confirm_key(state, &mut self.shared, key)
+            }
             Screen::Playlist(state) => handle_playlist_key(state, key),
             Screen::Format(state) => handle_format_key(state, &self.shared, key),
             Screen::Quality(state) => handle_quality_key(state, &mut self.shared, key),
@@ -685,6 +696,9 @@ fn handle_setup_key(state: &mut SetupState, shared: &mut SharedState, key: KeyEv
         KeyCode::Right if state.field == SetupField::CookieSource => {
             state.cookie_source_index = (state.cookie_source_index + 1) % 3;
         }
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::GenericConfirmation => {
+            state.confirm_generic_urls = !state.confirm_generic_urls;
+        }
         KeyCode::Left if state.field == SetupField::Browser => {
             state.browser_index =
                 (state.browser_index + Browser::ALL.len() - 1) % Browser::ALL.len();
@@ -734,6 +748,9 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
                 return Transition::Push(Screen::History(HistoryState::default()));
             }
             match detect_platform(&input) {
+                Ok(Platform::Generic) if shared.config.confirm_generic_urls => {
+                    Transition::Push(Screen::GenericConfirm(GenericConfirmState { url: input }))
+                }
                 Ok(_) => {
                     shared.start_preview(input);
                     Transition::Push(Screen::PreviewLoading(PreviewLoadingState::default()))
@@ -748,6 +765,29 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
         KeyCode::Char(ch) => {
             state.url_input.push(ch);
             Transition::Stay
+        }
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_generic_confirm_key(
+    state: &GenericConfirmState,
+    shared: &mut SharedState,
+    key: KeyEvent,
+) -> Transition {
+    match key.code {
+        KeyCode::Esc => Transition::Back,
+        KeyCode::Enter => {
+            shared.start_preview(state.url.clone());
+            Transition::Push(Screen::PreviewLoading(PreviewLoadingState::default()))
+        }
+        KeyCode::Char('a') => {
+            shared.config.confirm_generic_urls = false;
+            if let Err(error) = shared.config.save() {
+                return Transition::ShowError(error.to_string());
+            }
+            shared.start_preview(state.url.clone());
+            Transition::Push(Screen::PreviewLoading(PreviewLoadingState::default()))
         }
         _ => Transition::Stay,
     }
@@ -1038,6 +1078,7 @@ fn save_setup(state: &SetupState, shared: &mut SharedState) -> Result<()> {
         }
         _ => unreachable!("cookie source selection is always normalized"),
     };
+    shared.config.confirm_generic_urls = state.confirm_generic_urls;
     shared.config.save()?;
     shared.first_run = false;
     Ok(())
@@ -1071,6 +1112,7 @@ impl SetupState {
                 cookie_source_index,
                 browser_index,
                 cookie_file_path,
+                confirm_generic_urls: config.confirm_generic_urls,
             },
             Destination::Cloud { remote, path } => Self {
                 cloud: rclone_available,
@@ -1081,6 +1123,7 @@ impl SetupState {
                 cookie_source_index,
                 browser_index,
                 cookie_file_path,
+                confirm_generic_urls: config.confirm_generic_urls,
             },
         }
     }
@@ -1094,17 +1137,16 @@ impl SetupState {
             (SetupField::RemotePath, _, _) => SetupField::CookieSource,
             (SetupField::CookieSource, _, 1) => SetupField::Browser,
             (SetupField::CookieSource, _, 2) => SetupField::CookieFile,
-            (SetupField::CookieSource, _, _) => SetupField::Destination,
-            (SetupField::Browser, _, _) => SetupField::Destination,
-            (SetupField::CookieFile, _, _) => SetupField::Destination,
+            (SetupField::CookieSource, _, _) => SetupField::GenericConfirmation,
+            (SetupField::Browser, _, _) => SetupField::GenericConfirmation,
+            (SetupField::CookieFile, _, _) => SetupField::GenericConfirmation,
+            (SetupField::GenericConfirmation, _, _) => SetupField::Destination,
         };
     }
 
     fn prev_field(&mut self) {
         self.field = match (self.field, self.cloud, self.cookie_source_index) {
-            (SetupField::Destination, _, 1) => SetupField::Browser,
-            (SetupField::Destination, _, 2) => SetupField::CookieFile,
-            (SetupField::Destination, _, _) => SetupField::CookieSource,
+            (SetupField::Destination, _, _) => SetupField::GenericConfirmation,
             (SetupField::LocalPath, _, _) => SetupField::Destination,
             (SetupField::Remote, _, _) => SetupField::Destination,
             (SetupField::RemotePath, _, _) => SetupField::Remote,
@@ -1113,6 +1155,9 @@ impl SetupState {
             (SetupField::Browser, _, _) | (SetupField::CookieFile, _, _) => {
                 SetupField::CookieSource
             }
+            (SetupField::GenericConfirmation, _, 1) => SetupField::Browser,
+            (SetupField::GenericConfirmation, _, 2) => SetupField::CookieFile,
+            (SetupField::GenericConfirmation, _, _) => SetupField::CookieSource,
         };
     }
 
@@ -1122,7 +1167,10 @@ impl SetupState {
             SetupField::Remote => self.remote.push(ch),
             SetupField::RemotePath => self.remote_path.push(ch),
             SetupField::CookieFile => self.cookie_file_path.push(ch),
-            SetupField::Destination | SetupField::CookieSource | SetupField::Browser => {}
+            SetupField::Destination
+            | SetupField::CookieSource
+            | SetupField::Browser
+            | SetupField::GenericConfirmation => {}
         }
     }
 
@@ -1140,7 +1188,10 @@ impl SetupState {
             SetupField::CookieFile => {
                 self.cookie_file_path.pop();
             }
-            SetupField::Destination | SetupField::CookieSource | SetupField::Browser => {}
+            SetupField::Destination
+            | SetupField::CookieSource
+            | SetupField::Browser
+            | SetupField::GenericConfirmation => {}
         }
     }
 }

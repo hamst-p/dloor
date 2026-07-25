@@ -106,6 +106,7 @@ pub struct Config {
     pub destination: Destination,
     pub default_quality: Quality,
     pub cookies: CookieSource,
+    pub confirm_generic_urls: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -116,6 +117,8 @@ struct ConfigFile {
     cookies: Option<CookieSource>,
     #[serde(default)]
     browser: Option<Browser>,
+    #[serde(default = "default_confirm_generic_urls")]
+    confirm_generic_urls: bool,
 }
 
 impl<'de> serde::Deserialize<'de> for Config {
@@ -133,6 +136,7 @@ impl<'de> serde::Deserialize<'de> for Config {
                         browser,
                     })
             }),
+            confirm_generic_urls: file.confirm_generic_urls,
         })
     }
 }
@@ -145,8 +149,13 @@ impl Default for Config {
             },
             default_quality: Quality::Best,
             cookies: CookieSource::None,
+            confirm_generic_urls: default_confirm_generic_urls(),
         }
     }
+}
+
+const fn default_confirm_generic_urls() -> bool {
+    true
 }
 
 pub(crate) fn sanitized_ytdlp_error(stderr: &str, cookies: &CookieSource) -> String {
@@ -284,6 +293,7 @@ mod tests {
             cookies: CookieSource::Browser {
                 browser: Browser::Firefox,
             },
+            confirm_generic_urls: false,
         };
 
         config.save_to(&path).unwrap();
@@ -304,6 +314,7 @@ path = "/tmp"
         .unwrap();
 
         assert_eq!(config.cookies, CookieSource::None);
+        assert!(config.confirm_generic_urls);
     }
 
     #[test]
@@ -326,6 +337,7 @@ path = "/tmp"
                 browser: Browser::Firefox
             }
         );
+        assert!(config.confirm_generic_urls);
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("[cookies]"));
         assert!(!serialized.contains("browser = \"firefox\"\n\n[destination]"));

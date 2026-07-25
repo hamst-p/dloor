@@ -19,6 +19,12 @@ Supported URL families:
 - TikTok
 - Facebook
 - X / Twitter
+- Other valid `http://` or `https://` URLs supported by yt-dlp (unverified;
+  confirmation required by default)
+
+Unknown hosts are passed through to yt-dlp only after dloor validates the URL
+syntax and displays an “unverified host” confirmation. This does not expand
+dloor's access rights or bypass any site's controls.
 
 ## Status
 
@@ -180,14 +186,15 @@ Then enter the remote name and remote path in dloor's setup screen.
 
 1. Paste a supported URL into the main screen.
 2. Press `Enter`.
-3. Wait for the cancellable metadata preview and verify the title, uploader,
+3. For an unknown host, confirm that you want to try yt-dlp.
+4. Wait for the cancellable metadata preview and verify the title, uploader,
    duration, resolutions, and playlist sample.
-4. For a playlist, choose whether to download one item or the entire playlist.
-5. Choose `Video` or `Audio`.
-6. Choose `Best` or `Compressed`.
-7. The job is added to the queue and the main screen is ready for another URL.
-8. Open `/queue` to monitor current-item and overall progress.
-9. Open `/history` to review saved paths, failures, or retry a failed item.
+5. For a playlist, choose whether to download one item or the entire playlist.
+6. Choose `Video` or `Audio`.
+7. Choose `Best` or `Compressed`.
+8. The job is added to the queue and the main screen is ready for another URL.
+9. Open `/queue` to monitor current-item and overall progress.
+10. Open `/history` to review saved paths, failures, or retry a failed item.
 
 ## Key Commands
 
@@ -237,6 +244,11 @@ default_quality = "Compressed"
 Metadata previews use the same optional cookie setting as the eventual download.
 Playlist previews are limited to the first five entries;
 this limit is fixed and does not add a `config.toml` field.
+
+`confirm_generic_urls` defaults to `true`, including when an older config file
+does not contain it. Choosing `a` on the unverified-host screen stores `false`
+globally for all unknown hosts. Open `/settings` and set `Confirm generic URLs`
+to `Always` to restore the prompt.
 
 Runtime diagnostics are written to `dloor.log` beside `config.toml`. The file is
 limited to 5 MiB and one `dloor.log.1` backup is retained. Set `RUST_LOG` when
@@ -308,6 +320,8 @@ yt-dlp -U
 ```
 
 If that does not work, verify that the URL is public and that you have permission to download it.
+For an unknown host, “Generic (yt-dlp)” means the URL passed dloor's safety and
+syntax checks; it is not a compatibility guarantee.
 
 ### Cookie Authentication Fails
 
