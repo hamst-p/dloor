@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod deps;
+pub mod diagnostics;
 pub mod download;
 pub mod history;
 pub mod metadata;
@@ -19,6 +20,7 @@ pub use deps::{
     ParsedToolVersion, Tool, ToolVersion, VersionFreshness, YtDlpUpdateJob, YtDlpUpdateOutcome,
     YtDlpVersion, YT_DLP_STALE_DAYS,
 };
+pub use diagnostics::{diagnose_ytdlp_error, ErrorCause, ErrorDiagnosis};
 pub use download::{
     parse_progress_line, DownloadEvent, DownloadFailure, DownloadItem, DownloadJob,
     DownloadProgress, DownloadRequest, DownloadSuccess, DownloadSummary, DownloadWarning,

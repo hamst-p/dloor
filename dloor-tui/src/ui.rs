@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap},
@@ -896,15 +896,63 @@ fn truncate_text(value: &str, max_chars: usize) -> String {
 }
 
 fn render_error(frame: &mut Frame<'_>, state: &ErrorState) {
-    let area = centered(frame.area(), 76, 10);
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        Paragraph::new(state.message.as_str())
-            .block(Block::default().title("Error").borders(Borders::ALL))
-            .fg(Color::Red)
-            .wrap(Wrap { trim: false }),
-        area,
+    let area = frame.area().inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(2)])
+        .split(area);
+
+    let mut lines = Vec::new();
+    if let Some(diagnosis) = &state.diagnosis {
+        lines.push(Line::styled(
+            diagnosis.summary.as_str(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Suggested action",
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        lines.extend(
+            diagnosis
+                .advice
+                .lines()
+                .map(|line| Line::from(line.to_string())),
+        );
+        lines.push(Line::default());
+    }
+    lines.push(Line::styled(
+        "Raw error",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    ));
+    lines.extend(
+        state
+            .raw
+            .lines()
+            .map(|line| Line::styled(line.to_string(), Style::default().fg(Color::Red))),
     );
+
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Error details")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((state.scroll_offset, 0)),
+        chunks[0],
+    );
+    let footer = state.copy_status.as_ref().map_or_else(
+        || "↑/↓ scroll  PgUp/PgDn page  Home/End  c copy full error  Esc back".to_string(),
+        |status| format!("{status}  |  ↑/↓ scroll  PgUp/PgDn page  Home/End  c copy  Esc back"),
+    );
+    render_footer(frame, chunks[1], &footer);
 }
 
 fn render_queue_indicator(frame: &mut Frame<'_>, shared: &SharedState) {

@@ -221,6 +221,8 @@ Then enter the remote name and remote path in dloor's setup screen.
 - `Esc`: go back, or quit from the URL input screen
 - `Esc` while metadata is loading: cancel the preview request
 - `Esc` during a download: cancel the active `yt-dlp`, `ffmpeg`, or `rclone` process
+- Error screen `↑` / `↓`, `PageUp` / `PageDown`, `Home` / `End`: scroll long diagnostics
+- Error screen `c`: copy the diagnosis, suggested action, and complete raw error
 - Arrow keys: move between scope, format, and quality choices
 - Queue screen `Ctrl+Up` / `Ctrl+Down`: reorder a waiting job
 - Queue screen `c`: cancel the selected job
@@ -380,6 +382,12 @@ rclone config
 Then open `/settings` in dloor and enter your remote name.
 
 ### Platform Download Fails
+
+The error screen recognizes conservative signatures for authentication, regional
+availability, removed media, unavailable formats, an old yt-dlp, and network
+failures. A matching summary and suggested action appear above the unmodified
+tool error. Ambiguous messages are left unclassified rather than guessed. Press
+`c` to copy the complete diagnostic package for a bug report.
 
 Some platforms change frequently, require login, or block automated downloads. Update `yt-dlp` first:
 

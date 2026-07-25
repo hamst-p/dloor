@@ -2,14 +2,17 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dloor_core::{
     check_dependency_presence, check_media_capabilities, config::default_download_dir,
-    detect_platform, Browser, Config, CookieSource, DependencyJob, DependencyReport, Destination,
-    DownloadEvent, DownloadItem, DownloadJob, DownloadProgress, DownloadQueue, DownloadRequest,
-    DownloadSummary, Format, HistoryEntry, HistoryStatus, HistoryStore, JobId, MetadataJob,
-    MetadataPreview, MetadataRequest, Platform, PlaylistSelection, Quality, QueueStatus,
-    YtDlpUpdateJob, YtDlpUpdateOutcome, DEFAULT_HISTORY_LIMIT,
+    detect_platform, diagnose_ytdlp_error, Browser, Config, CookieSource, DependencyJob,
+    DependencyReport, Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress,
+    DownloadQueue, DownloadRequest, DownloadSummary, ErrorDiagnosis, Format, HistoryEntry,
+    HistoryStatus, HistoryStore, JobId, MetadataJob, MetadataPreview, MetadataRequest, Platform,
+    PlaylistSelection, Quality, QueueStatus, Tool, YtDlpUpdateJob, YtDlpUpdateOutcome,
+    DEFAULT_HISTORY_LIMIT,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use crate::clipboard::ClipboardService;
 
 #[derive(Debug)]
 pub enum Screen {
@@ -109,7 +112,57 @@ pub struct UpdateResultState {
 
 #[derive(Debug)]
 pub struct ErrorState {
-    pub message: String,
+    pub raw: String,
+    pub diagnosis: Option<ErrorDiagnosis>,
+    pub scroll_offset: u16,
+    pub copy_status: Option<String>,
+}
+
+impl ErrorState {
+    fn new(raw: String, report: &DependencyReport) -> Self {
+        let version = report
+            .version(Tool::YtDlp)
+            .map(|version| version.raw.as_str());
+        let diagnosis = diagnose_ytdlp_error(&raw, version, report.yt_dlp_freshness());
+        Self {
+            raw,
+            diagnosis,
+            scroll_offset: 0,
+            copy_status: None,
+        }
+    }
+
+    pub fn diagnostic_text(&self) -> String {
+        let mut sections = Vec::new();
+        if let Some(diagnosis) = &self.diagnosis {
+            sections.push(format!(
+                "{}\n\nSuggested action:\n{}",
+                diagnosis.summary, diagnosis.advice
+            ));
+        }
+        sections.push(format!("Raw error:\n{}", self.raw));
+        sections.join("\n\n")
+    }
+
+    fn max_scroll(&self) -> u16 {
+        let estimated_lines: usize = self
+            .diagnostic_text()
+            .lines()
+            .map(|line| line.chars().count().div_ceil(80).max(1))
+            .sum();
+        u16::try_from(estimated_lines.saturating_sub(6)).unwrap_or(u16::MAX)
+    }
+
+    fn scroll_by(&mut self, amount: i16) {
+        if amount.is_negative() {
+            self.scroll_offset = self.scroll_offset.saturating_sub(amount.unsigned_abs());
+        } else {
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_add(amount as u16)
+                .min(self.max_scroll());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +224,7 @@ pub struct SharedState {
     pub dependency_report: DependencyReport,
     dependency_receiver: Option<mpsc::Receiver<DownloadEvent>>,
     update_receiver: Option<mpsc::Receiver<DownloadEvent>>,
+    clipboard: ClipboardService,
     pub notification: Option<String>,
     startup_error: Option<String>,
 }
@@ -264,6 +318,7 @@ impl App {
                 dependency_report: presence,
                 dependency_receiver,
                 update_receiver: None,
+                clipboard: ClipboardService::new(),
                 notification: (!media_warnings.is_empty()).then(|| media_warnings.join(" ")),
                 startup_error,
             },
@@ -303,7 +358,10 @@ impl App {
                         .replace(Screen::Preview(PreviewState { url, preview }));
                 }
             }
-            Some(PreviewTerminal::Failed(error)) => self.navigation.show_error(error),
+            Some(PreviewTerminal::Failed(error)) => {
+                let state = ErrorState::new(error, &self.shared.dependency_report);
+                self.navigation.show_error(state);
+            }
             Some(PreviewTerminal::Cancelled) => {
                 if matches!(self.navigation.current, Screen::PreviewLoading(_)) {
                     self.navigation.back();
@@ -332,7 +390,8 @@ impl App {
             }
             Some(DownloadTerminal::Failed(job_id, error)) => {
                 if monitored_job == Some(job_id) {
-                    self.navigation.show_error(error);
+                    let state = ErrorState::new(error, &self.shared.dependency_report);
+                    self.navigation.show_error(state);
                 } else {
                     self.shared.notification = Some(format!("Job {} failed", job_id.0));
                 }
@@ -381,7 +440,7 @@ impl App {
             Screen::UpdateRunning => Transition::Stay,
             Screen::UpdateResult(_) => handle_update_result_key(key),
             Screen::ExitConfirm => handle_exit_confirm_key(&mut self.shared, key),
-            Screen::Error(_) => handle_error_key(key),
+            Screen::Error(state) => handle_error_key(state, &mut self.shared, key),
         };
         self.apply_transition(transition)
     }
@@ -410,7 +469,10 @@ impl App {
             Transition::ReturnToMain { clear_input } => {
                 self.navigation.return_to_main(clear_input);
             }
-            Transition::ShowError(message) => self.navigation.show_error(message),
+            Transition::ShowError(message) => {
+                let state = ErrorState::new(message, &self.shared.dependency_report);
+                self.navigation.show_error(state);
+            }
             Transition::Quit => {
                 if self.shared.queue.has_unfinished() {
                     self.navigation.push(Screen::ExitConfirm);
@@ -782,9 +844,9 @@ impl Navigation {
         self.back_stack.clear();
     }
 
-    fn show_error(&mut self, message: String) {
+    fn show_error(&mut self, state: ErrorState) {
         self.return_to_main(false);
-        self.push(Screen::Error(ErrorState { message }));
+        self.push(Screen::Error(state));
     }
 }
 
@@ -1196,10 +1258,41 @@ fn handle_complete_key(key: KeyEvent) -> Transition {
     }
 }
 
-fn handle_error_key(key: KeyEvent) -> Transition {
+fn handle_error_key(state: &mut ErrorState, shared: &mut SharedState, key: KeyEvent) -> Transition {
     match key.code {
         KeyCode::Enter | KeyCode::Esc => Transition::Back,
         KeyCode::Char('q') => Transition::Quit,
+        KeyCode::Up => {
+            state.scroll_by(-1);
+            Transition::Stay
+        }
+        KeyCode::Down => {
+            state.scroll_by(1);
+            Transition::Stay
+        }
+        KeyCode::PageUp => {
+            state.scroll_by(-8);
+            Transition::Stay
+        }
+        KeyCode::PageDown => {
+            state.scroll_by(8);
+            Transition::Stay
+        }
+        KeyCode::Home => {
+            state.scroll_offset = 0;
+            Transition::Stay
+        }
+        KeyCode::End => {
+            state.scroll_offset = state.max_scroll();
+            Transition::Stay
+        }
+        KeyCode::Char('c') => {
+            state.copy_status = Some(match shared.clipboard.copy_text(state.diagnostic_text()) {
+                Ok(()) => "Copied full diagnostics to the clipboard".to_string(),
+                Err(error) => format!("Copy failed: {error}"),
+            });
+            Transition::Stay
+        }
         _ => Transition::Stay,
     }
 }
@@ -1497,6 +1590,7 @@ mod tests {
             dependency_report: DependencyReport::default(),
             dependency_receiver: None,
             update_receiver: None,
+            clipboard: ClipboardService::unavailable(),
             notification: None,
             startup_error: None,
         }
@@ -1546,7 +1640,10 @@ mod tests {
     fn errors_always_return_to_main() {
         let mut navigation = Navigation::new(Screen::Main(MainState::default()));
         navigation.push(format_screen());
-        navigation.show_error("failed".to_string());
+        navigation.show_error(ErrorState::new(
+            "failed".to_string(),
+            &DependencyReport::default(),
+        ));
 
         assert!(matches!(navigation.current, Screen::Error(_)));
         assert!(navigation.back());

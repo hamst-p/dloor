@@ -9,6 +9,7 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control"] }
 crossterm = "0.28"
 directories = "5.0"
 regex = "1.11"

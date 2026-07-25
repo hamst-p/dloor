@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod ui;
 
 use std::{

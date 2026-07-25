@@ -118,6 +118,10 @@ impl DependencyReport {
         }
     }
 
+    pub fn yt_dlp_freshness(&self) -> VersionFreshness {
+        self.yt_dlp_freshness_on(OffsetDateTime::now_utc().date())
+    }
+
     pub fn message(&self) -> String {
         let mut lines = Vec::new();
         if !self.missing_required.is_empty() {
