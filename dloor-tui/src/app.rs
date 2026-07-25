@@ -1,10 +1,10 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dloor_core::{
-    check_dependencies, config::default_download_dir, detect_platform, Browser, Config,
-    CookieSource, Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress,
-    DownloadQueue, DownloadRequest, DownloadSummary, Format, HistoryEntry, HistoryStatus,
-    HistoryStore, JobId, MetadataJob, MetadataPreview, MetadataRequest, Platform,
+    check_dependencies, check_media_capabilities, config::default_download_dir, detect_platform,
+    Browser, Config, CookieSource, Destination, DownloadEvent, DownloadItem, DownloadJob,
+    DownloadProgress, DownloadQueue, DownloadRequest, DownloadSummary, Format, HistoryEntry,
+    HistoryStatus, HistoryStore, JobId, MetadataJob, MetadataPreview, MetadataRequest, Platform,
     PlaylistSelection, Quality, QueueStatus, DEFAULT_HISTORY_LIMIT,
 };
 use tokio::sync::mpsc;
@@ -115,6 +115,12 @@ pub enum SetupField {
     Browser,
     CookieFile,
     GenericConfirmation,
+    WriteSubtitles,
+    EmbedSubtitles,
+    SubtitleLanguages,
+    AutoSubtitles,
+    EmbedThumbnail,
+    EmbedChapters,
 }
 
 #[derive(Debug)]
@@ -128,6 +134,13 @@ pub struct SetupState {
     pub browser_index: usize,
     pub cookie_file_path: String,
     pub confirm_generic_urls: bool,
+    pub write_subtitles: bool,
+    pub embed_subtitles: bool,
+    pub subtitle_languages: String,
+    pub include_auto_subtitles: bool,
+    pub embed_thumbnail: bool,
+    pub embed_chapters: bool,
+    pub scroll_offset: usize,
 }
 
 #[derive(Debug)]
@@ -217,6 +230,7 @@ impl App {
             Screen::Main(MainState::default())
         };
         let history = HistoryStore::open(Config::history_path()?, DEFAULT_HISTORY_LIMIT)?;
+        let media_warnings = check_media_capabilities(&config.media);
 
         Ok(Self {
             shared: SharedState {
@@ -228,7 +242,7 @@ impl App {
                 history,
                 active_download: None,
                 active_preview: None,
-                notification: None,
+                notification: (!media_warnings.is_empty()).then(|| media_warnings.join(" ")),
                 startup_error,
             },
             navigation: Navigation::new(initial_screen),
@@ -454,6 +468,10 @@ impl SharedState {
                         active.item = Some(failure.item);
                         active.status_text = "Item failed; continuing...".to_string();
                     }
+                    DownloadEvent::ItemWarning { warning } => {
+                        active.item = Some(warning.item);
+                        active.status_text = format!("Warning: {}", warning.message);
+                    }
                     DownloadEvent::Finished { summary } => {
                         terminal = Some(DownloadTerminal::Finished(active.job_id, summary));
                     }
@@ -553,6 +571,7 @@ impl SharedState {
             | DownloadEvent::Progress { .. }
             | DownloadEvent::Converting { .. }
             | DownloadEvent::Uploading { .. }
+            | DownloadEvent::ItemWarning { .. }
             | DownloadEvent::Finished { .. } => None,
         };
         if let Some(entry) = entry {
@@ -698,6 +717,21 @@ fn handle_setup_key(state: &mut SetupState, shared: &mut SharedState, key: KeyEv
         }
         KeyCode::Left | KeyCode::Right if state.field == SetupField::GenericConfirmation => {
             state.confirm_generic_urls = !state.confirm_generic_urls;
+        }
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::WriteSubtitles => {
+            state.write_subtitles = !state.write_subtitles;
+        }
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::EmbedSubtitles => {
+            state.embed_subtitles = !state.embed_subtitles;
+        }
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::AutoSubtitles => {
+            state.include_auto_subtitles = !state.include_auto_subtitles;
+        }
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::EmbedThumbnail => {
+            state.embed_thumbnail = !state.embed_thumbnail;
+        }
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::EmbedChapters => {
+            state.embed_chapters = !state.embed_chapters;
         }
         KeyCode::Left if state.field == SetupField::Browser => {
             state.browser_index =
@@ -1079,7 +1113,23 @@ fn save_setup(state: &SetupState, shared: &mut SharedState) -> Result<()> {
         _ => unreachable!("cookie source selection is always normalized"),
     };
     shared.config.confirm_generic_urls = state.confirm_generic_urls;
+    shared.config.media.write_subtitles = state.write_subtitles;
+    shared.config.media.embed_subtitles = state.embed_subtitles;
+    shared.config.media.subtitle_languages = state
+        .subtitle_languages
+        .split(',')
+        .map(str::trim)
+        .filter(|language| !language.is_empty())
+        .map(str::to_string)
+        .collect();
+    shared.config.media.include_auto_subtitles = state.include_auto_subtitles;
+    shared.config.media.embed_thumbnail = state.embed_thumbnail;
+    shared.config.media.embed_chapters = state.embed_chapters;
     shared.config.save()?;
+    let media_warnings = check_media_capabilities(&shared.config.media);
+    if !media_warnings.is_empty() {
+        shared.notification = Some(media_warnings.join(" "));
+    }
     shared.first_run = false;
     Ok(())
 }
@@ -1113,6 +1163,13 @@ impl SetupState {
                 browser_index,
                 cookie_file_path,
                 confirm_generic_urls: config.confirm_generic_urls,
+                write_subtitles: config.media.write_subtitles,
+                embed_subtitles: config.media.embed_subtitles,
+                subtitle_languages: config.media.subtitle_languages.join(","),
+                include_auto_subtitles: config.media.include_auto_subtitles,
+                embed_thumbnail: config.media.embed_thumbnail,
+                embed_chapters: config.media.embed_chapters,
+                scroll_offset: 0,
             },
             Destination::Cloud { remote, path } => Self {
                 cloud: rclone_available,
@@ -1124,41 +1181,63 @@ impl SetupState {
                 browser_index,
                 cookie_file_path,
                 confirm_generic_urls: config.confirm_generic_urls,
+                write_subtitles: config.media.write_subtitles,
+                embed_subtitles: config.media.embed_subtitles,
+                subtitle_languages: config.media.subtitle_languages.join(","),
+                include_auto_subtitles: config.media.include_auto_subtitles,
+                embed_thumbnail: config.media.embed_thumbnail,
+                embed_chapters: config.media.embed_chapters,
+                scroll_offset: 0,
             },
         }
     }
 
     fn next_field(&mut self) {
-        self.field = match (self.field, self.cloud, self.cookie_source_index) {
-            (SetupField::Destination, false, _) => SetupField::LocalPath,
-            (SetupField::Destination, true, _) => SetupField::Remote,
-            (SetupField::LocalPath, _, _) => SetupField::CookieSource,
-            (SetupField::Remote, _, _) => SetupField::RemotePath,
-            (SetupField::RemotePath, _, _) => SetupField::CookieSource,
-            (SetupField::CookieSource, _, 1) => SetupField::Browser,
-            (SetupField::CookieSource, _, 2) => SetupField::CookieFile,
-            (SetupField::CookieSource, _, _) => SetupField::GenericConfirmation,
-            (SetupField::Browser, _, _) => SetupField::GenericConfirmation,
-            (SetupField::CookieFile, _, _) => SetupField::GenericConfirmation,
-            (SetupField::GenericConfirmation, _, _) => SetupField::Destination,
-        };
+        self.move_field(true);
     }
 
     fn prev_field(&mut self) {
-        self.field = match (self.field, self.cloud, self.cookie_source_index) {
-            (SetupField::Destination, _, _) => SetupField::GenericConfirmation,
-            (SetupField::LocalPath, _, _) => SetupField::Destination,
-            (SetupField::Remote, _, _) => SetupField::Destination,
-            (SetupField::RemotePath, _, _) => SetupField::Remote,
-            (SetupField::CookieSource, false, _) => SetupField::LocalPath,
-            (SetupField::CookieSource, true, _) => SetupField::RemotePath,
-            (SetupField::Browser, _, _) | (SetupField::CookieFile, _, _) => {
-                SetupField::CookieSource
-            }
-            (SetupField::GenericConfirmation, _, 1) => SetupField::Browser,
-            (SetupField::GenericConfirmation, _, 2) => SetupField::CookieFile,
-            (SetupField::GenericConfirmation, _, _) => SetupField::CookieSource,
+        self.move_field(false);
+    }
+
+    fn move_field(&mut self, forward: bool) {
+        let fields = self.fields();
+        let current = fields
+            .iter()
+            .position(|field| *field == self.field)
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % fields.len()
+        } else {
+            (current + fields.len() - 1) % fields.len()
         };
+        self.field = fields[next];
+        self.scroll_offset = next.saturating_sub(5);
+    }
+
+    fn fields(&self) -> Vec<SetupField> {
+        let mut fields = vec![SetupField::Destination];
+        if self.cloud {
+            fields.extend([SetupField::Remote, SetupField::RemotePath]);
+        } else {
+            fields.push(SetupField::LocalPath);
+        }
+        fields.push(SetupField::CookieSource);
+        match self.cookie_source_index {
+            1 => fields.push(SetupField::Browser),
+            2 => fields.push(SetupField::CookieFile),
+            _ => {}
+        }
+        fields.extend([
+            SetupField::GenericConfirmation,
+            SetupField::WriteSubtitles,
+            SetupField::EmbedSubtitles,
+            SetupField::SubtitleLanguages,
+            SetupField::AutoSubtitles,
+            SetupField::EmbedThumbnail,
+            SetupField::EmbedChapters,
+        ]);
+        fields
     }
 
     fn push_char(&mut self, ch: char) {
@@ -1167,10 +1246,16 @@ impl SetupState {
             SetupField::Remote => self.remote.push(ch),
             SetupField::RemotePath => self.remote_path.push(ch),
             SetupField::CookieFile => self.cookie_file_path.push(ch),
+            SetupField::SubtitleLanguages => self.subtitle_languages.push(ch),
             SetupField::Destination
             | SetupField::CookieSource
             | SetupField::Browser
-            | SetupField::GenericConfirmation => {}
+            | SetupField::GenericConfirmation
+            | SetupField::WriteSubtitles
+            | SetupField::EmbedSubtitles
+            | SetupField::AutoSubtitles
+            | SetupField::EmbedThumbnail
+            | SetupField::EmbedChapters => {}
         }
     }
 
@@ -1188,10 +1273,18 @@ impl SetupState {
             SetupField::CookieFile => {
                 self.cookie_file_path.pop();
             }
+            SetupField::SubtitleLanguages => {
+                self.subtitle_languages.pop();
+            }
             SetupField::Destination
             | SetupField::CookieSource
             | SetupField::Browser
-            | SetupField::GenericConfirmation => {}
+            | SetupField::GenericConfirmation
+            | SetupField::WriteSubtitles
+            | SetupField::EmbedSubtitles
+            | SetupField::AutoSubtitles
+            | SetupField::EmbedThumbnail
+            | SetupField::EmbedChapters => {}
         }
     }
 }

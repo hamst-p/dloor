@@ -101,12 +101,24 @@ impl CookieSource {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MediaOptions {
+    pub write_subtitles: bool,
+    pub embed_subtitles: bool,
+    pub subtitle_languages: Vec<String>,
+    pub include_auto_subtitles: bool,
+    pub embed_thumbnail: bool,
+    pub embed_chapters: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Config {
     pub destination: Destination,
     pub default_quality: Quality,
     pub cookies: CookieSource,
     pub confirm_generic_urls: bool,
+    pub media: MediaOptions,
 }
 
 #[derive(serde::Deserialize)]
@@ -119,6 +131,8 @@ struct ConfigFile {
     browser: Option<Browser>,
     #[serde(default = "default_confirm_generic_urls")]
     confirm_generic_urls: bool,
+    #[serde(default)]
+    media: MediaOptions,
 }
 
 impl<'de> serde::Deserialize<'de> for Config {
@@ -137,6 +151,7 @@ impl<'de> serde::Deserialize<'de> for Config {
                     })
             }),
             confirm_generic_urls: file.confirm_generic_urls,
+            media: file.media,
         })
     }
 }
@@ -150,6 +165,7 @@ impl Default for Config {
             default_quality: Quality::Best,
             cookies: CookieSource::None,
             confirm_generic_urls: default_confirm_generic_urls(),
+            media: MediaOptions::default(),
         }
     }
 }
@@ -294,6 +310,14 @@ mod tests {
                 browser: Browser::Firefox,
             },
             confirm_generic_urls: false,
+            media: MediaOptions {
+                write_subtitles: true,
+                embed_subtitles: true,
+                subtitle_languages: vec!["en".to_string(), "ja".to_string()],
+                include_auto_subtitles: false,
+                embed_thumbnail: true,
+                embed_chapters: true,
+            },
         };
 
         config.save_to(&path).unwrap();
@@ -315,6 +339,7 @@ path = "/tmp"
 
         assert_eq!(config.cookies, CookieSource::None);
         assert!(config.confirm_generic_urls);
+        assert_eq!(config.media, MediaOptions::default());
     }
 
     #[test]
@@ -338,6 +363,7 @@ path = "/tmp"
             }
         );
         assert!(config.confirm_generic_urls);
+        assert_eq!(config.media, MediaOptions::default());
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("[cookies]"));
         assert!(!serialized.contains("browser = \"firefox\"\n\n[destination]"));

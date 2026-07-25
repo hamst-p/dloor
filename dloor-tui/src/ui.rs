@@ -183,12 +183,53 @@ fn render_setup(
         },
         state.field == SetupField::GenericConfirmation,
     ));
+    lines.push(Line::from(""));
+    lines.push(Line::from("Optional media").bold());
+    lines.push(field_line(
+        "Write subtitle files",
+        on_off(state.write_subtitles),
+        state.field == SetupField::WriteSubtitles,
+    ));
+    lines.push(field_line(
+        "Embed subtitles",
+        on_off(state.embed_subtitles),
+        state.field == SetupField::EmbedSubtitles,
+    ));
+    lines.push(field_line(
+        "Subtitle languages",
+        if state.subtitle_languages.is_empty() {
+            "all requested languages"
+        } else {
+            &state.subtitle_languages
+        },
+        state.field == SetupField::SubtitleLanguages,
+    ));
+    lines.push(field_line(
+        "Include auto subtitles",
+        on_off(state.include_auto_subtitles),
+        state.field == SetupField::AutoSubtitles,
+    ));
+    lines.push(field_line(
+        "Embed thumbnail",
+        on_off(state.embed_thumbnail),
+        state.field == SetupField::EmbedThumbnail,
+    ));
+    lines.push(field_line(
+        "Embed chapters",
+        on_off(state.embed_chapters),
+        state.field == SetupField::EmbedChapters,
+    ));
+    lines.push(Line::from(Span::styled(
+        "Optional embedding failures keep the downloaded media and appear as warnings.",
+        Style::new().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(title).borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        centered(chunks[1], 88, 20),
+            .wrap(Wrap { trim: false })
+            .scroll((state.scroll_offset as u16, 0)),
+        centered(chunks[1], 90, 22),
     );
     render_footer(frame, chunks[2], "Tab: next field  Enter: save  Esc: back");
 }
@@ -203,6 +244,14 @@ fn field_line(label: &str, value: &str, selected: bool) -> Line<'static> {
         Span::styled(format!("{label}: "), style),
         Span::styled(value.to_string(), style),
     ])
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "On"
+    } else {
+        "Off"
+    }
 }
 
 fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
@@ -549,6 +598,16 @@ fn render_complete(frame: &mut Frame<'_>, state: &CompleteState) {
                 truncate_text(&failure.error, 44)
             ))
             .red(),
+        );
+    }
+    for warning in state.summary.warnings.iter().take(3) {
+        lines.push(
+            Line::from(format!(
+                "⚠ {}: {}",
+                truncate_text(&warning.item.title, 24),
+                truncate_text(&warning.message, 54)
+            ))
+            .yellow(),
         );
     }
     frame.render_widget(

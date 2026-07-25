@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::{
-    config::{sanitized_ytdlp_error, Config, CookieSource, Destination},
+    config::{sanitized_ytdlp_error, Config, CookieSource, Destination, MediaOptions},
     detect_platform, Error, MetadataPreview, Platform, Result,
 };
 
@@ -93,11 +93,28 @@ pub struct DownloadFailure {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DownloadWarningKind {
+    SubtitleEmbedding,
+    ThumbnailEmbedding,
+    ChapterEmbedding,
+    SubtitleSidecar,
+    OptionalPostProcessing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadWarning {
+    pub item: DownloadItem,
+    pub kind: DownloadWarningKind,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DownloadSummary {
     pub total: usize,
     pub succeeded: Vec<DownloadSuccess>,
     pub failed: Vec<DownloadFailure>,
+    pub warnings: Vec<DownloadWarning>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +148,9 @@ pub enum DownloadEvent {
     ItemFailed {
         failure: DownloadFailure,
     },
+    ItemWarning {
+        warning: DownloadWarning,
+    },
     Finished {
         summary: DownloadSummary,
     },
@@ -146,6 +166,18 @@ pub enum DownloadEvent {
 struct ResolvedItem {
     display: DownloadItem,
     target: DownloadTarget,
+}
+
+#[derive(Debug)]
+struct ItemRunResult {
+    path: String,
+    warnings: Vec<DownloadWarning>,
+}
+
+#[derive(Debug)]
+struct YtdlpOutput {
+    path: PathBuf,
+    warnings: Vec<DownloadWarning>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -224,8 +256,15 @@ impl DownloadJob {
                 )
                 .await
             {
-                Ok(path) => {
-                    let result = DownloadSuccess { item, path };
+                Ok(outcome) => {
+                    for warning in outcome.warnings {
+                        summary.warnings.push(warning.clone());
+                        tx.send(DownloadEvent::ItemWarning { warning }).await.ok();
+                    }
+                    let result = DownloadSuccess {
+                        item,
+                        path: outcome.path,
+                    };
                     summary.succeeded.push(result.clone());
                     tx.send(DownloadEvent::ItemCompleted { result }).await.ok();
                 }
@@ -254,10 +293,10 @@ impl DownloadJob {
         platform: Platform,
         processed_items: usize,
         tx: &mpsc::Sender<DownloadEvent>,
-    ) -> Result<String> {
+    ) -> Result<ItemRunResult> {
         let (work_dir, _temp_guard) = self.prepare_work_dir().await?;
         let output_template = work_dir.join("%(title)s [%(id)s].%(ext)s");
-        let downloaded = self
+        let output = self
             .run_ytdlp(
                 &output_template,
                 resolved.target,
@@ -267,6 +306,8 @@ impl DownloadJob {
                 tx,
             )
             .await?;
+        let downloaded = output.path;
+        let mut warnings = output.warnings;
         self.ensure_not_cancelled()?;
 
         let final_local = if self.request.format == Format::Video
@@ -283,11 +324,28 @@ impl DownloadJob {
         };
         self.ensure_not_cancelled()?;
 
+        let sidecars = if self.config.media.write_subtitles {
+            collect_subtitle_sidecars(&work_dir, &final_local).await?
+        } else {
+            Vec::new()
+        };
         let completed_path = match &self.config.destination {
             Destination::Local { path } => {
                 fs::create_dir_all(path).await?;
                 let destination = unique_destination(path, &final_local).await?;
                 move_file(&final_local, &destination).await?;
+                for sidecar in sidecars {
+                    if let Err(error) = move_sidecar(&sidecar, path).await {
+                        warnings.push(DownloadWarning {
+                            item: resolved.display.clone(),
+                            kind: DownloadWarningKind::SubtitleSidecar,
+                            message: format!(
+                                "A subtitle sidecar could not be saved: {}",
+                                error_kind(&error)
+                            ),
+                        });
+                    }
+                }
                 destination.to_string_lossy().to_string()
             }
             Destination::Cloud { remote, path } => {
@@ -297,6 +355,20 @@ impl DownloadJob {
                 .await
                 .ok();
                 upload_to_cloud(&final_local, remote, path, &self.cancellation).await?;
+                for sidecar in sidecars {
+                    match upload_to_cloud(&sidecar, remote, path, &self.cancellation).await {
+                        Ok(()) => {}
+                        Err(Error::Cancelled) => return Err(Error::Cancelled),
+                        Err(error) => warnings.push(DownloadWarning {
+                            item: resolved.display.clone(),
+                            kind: DownloadWarningKind::SubtitleSidecar,
+                            message: format!(
+                                "A subtitle sidecar could not be uploaded: {}",
+                                error_kind(&error)
+                            ),
+                        }),
+                    }
+                }
                 let file_name = final_local
                     .file_name()
                     .ok_or_else(|| Error::InvalidPath(final_local.display().to_string()))?
@@ -305,7 +377,10 @@ impl DownloadJob {
             }
         };
         self.ensure_not_cancelled()?;
-        Ok(completed_path)
+        Ok(ItemRunResult {
+            path: completed_path,
+            warnings,
+        })
     }
 
     fn ensure_not_cancelled(&self) -> Result<()> {
@@ -331,9 +406,16 @@ impl DownloadJob {
         processed_items: usize,
         platform: Platform,
         tx: &mpsc::Sender<DownloadEvent>,
-    ) -> Result<PathBuf> {
+    ) -> Result<YtdlpOutput> {
         let mut args = base_ytdlp_args(output_template, &self.config.cookies);
         args.extend(format_args(self.request.format, self.request.quality));
+        let (optional_args, mut warnings) = media_args(
+            &self.config.media,
+            self.request.format,
+            self.request.quality,
+            &item,
+        );
+        args.extend(optional_args);
         args.extend(download_target_args(target));
         args.push(OsString::from(&self.request.url));
 
@@ -426,7 +508,20 @@ impl DownloadJob {
             status = child.wait() => status?,
         };
         let stderr = stderr_messages.join("\n");
+        warnings.extend(postprocessing_warnings(&stderr, &self.config.media, &item));
+        deduplicate_warnings(&mut warnings);
+        let output_path = output_path.ok_or(Error::MissingOutputFile)?;
+        let output_is_valid = output_path.extension().is_none_or(|ext| ext != "part")
+            && fs::metadata(&output_path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
         if !status.success() {
+            if output_is_valid && !warnings.is_empty() {
+                return Ok(YtdlpOutput {
+                    path: output_path,
+                    warnings,
+                });
+            }
             let message = if stderr.trim().is_empty() {
                 format!("yt-dlp exited with {status}")
             } else {
@@ -434,13 +529,13 @@ impl DownloadJob {
             };
             return Err(Error::ProcessFailed(message));
         }
-        let output_path = output_path.ok_or(Error::MissingOutputFile)?;
-        if output_path.extension().is_some_and(|ext| ext == "part")
-            || !fs::try_exists(&output_path).await?
-        {
+        if !output_is_valid {
             return Err(Error::MissingOutputFile);
         }
-        Ok(output_path)
+        Ok(YtdlpOutput {
+            path: output_path,
+            warnings,
+        })
     }
 
     async fn resolve_items(&self) -> Result<Vec<ResolvedItem>> {
@@ -718,6 +813,150 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
             "5".into(),
         ],
     }
+}
+
+fn media_args(
+    options: &MediaOptions,
+    format: Format,
+    quality: Quality,
+    item: &DownloadItem,
+) -> (Vec<OsString>, Vec<DownloadWarning>) {
+    let mut args = Vec::new();
+    let mut warnings = Vec::new();
+    let wants_subtitles = options.write_subtitles || options.embed_subtitles;
+    if wants_subtitles {
+        args.push("--write-subs".into());
+        if options.include_auto_subtitles {
+            args.push("--write-auto-subs".into());
+        }
+        let languages = options
+            .subtitle_languages
+            .iter()
+            .map(|language| language.trim())
+            .filter(|language| !language.is_empty())
+            .collect::<Vec<_>>();
+        if !languages.is_empty() {
+            args.push("--sub-langs".into());
+            args.push(languages.join(",").into());
+        }
+    }
+
+    let mut embeds_anything = false;
+    if options.embed_subtitles {
+        if format == Format::Video {
+            args.push("--embed-subs".into());
+            embeds_anything = true;
+        } else {
+            warnings.push(DownloadWarning {
+                item: item.clone(),
+                kind: DownloadWarningKind::SubtitleEmbedding,
+                message:
+                    "Subtitle embedding is unavailable for audio output; requested sidecars are still written."
+                        .to_string(),
+            });
+        }
+    }
+
+    if options.embed_thumbnail {
+        if format == Format::Video && quality == Quality::Compressed {
+            warnings.push(DownloadWarning {
+                item: item.clone(),
+                kind: DownloadWarningKind::ThumbnailEmbedding,
+                message:
+                    "Thumbnail embedding is skipped because the compressed-video transcode cannot retain it reliably."
+                        .to_string(),
+            });
+        } else {
+            args.extend(["--write-thumbnail".into(), "--embed-thumbnail".into()]);
+            embeds_anything = true;
+        }
+    }
+
+    if options.embed_chapters {
+        if format == Format::Audio && quality == Quality::Compressed {
+            warnings.push(DownloadWarning {
+                item: item.clone(),
+                kind: DownloadWarningKind::ChapterEmbedding,
+                message:
+                    "Chapter embedding is skipped for compressed MP3 output because support varies by player."
+                        .to_string(),
+            });
+        } else {
+            args.push("--embed-chapters".into());
+            embeds_anything = true;
+        }
+    }
+
+    if embeds_anything {
+        args.push("--ignore-errors".into());
+    }
+    (args, warnings)
+}
+
+fn postprocessing_warnings(
+    stderr: &str,
+    options: &MediaOptions,
+    item: &DownloadItem,
+) -> Vec<DownloadWarning> {
+    let lower = stderr.to_ascii_lowercase();
+    let indicates_failure = lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("unable")
+        || lower.contains("unsupported");
+    if !indicates_failure {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    if options.embed_subtitles && (lower.contains("subtitle") || lower.contains("embedsubtitles")) {
+        warnings.push(DownloadWarning {
+            item: item.clone(),
+            kind: DownloadWarningKind::SubtitleEmbedding,
+            message: "Subtitle embedding was not fully applied; the downloaded media was retained."
+                .to_string(),
+        });
+    }
+    if options.embed_thumbnail
+        && (lower.contains("thumbnail")
+            || lower.contains("embedthumbnail")
+            || lower.contains("atomicparsley"))
+    {
+        warnings.push(DownloadWarning {
+            item: item.clone(),
+            kind: DownloadWarningKind::ThumbnailEmbedding,
+            message:
+                "Thumbnail embedding was not fully applied; the downloaded media was retained."
+                    .to_string(),
+        });
+    }
+    if options.embed_chapters && (lower.contains("chapter") || lower.contains("metadata")) {
+        warnings.push(DownloadWarning {
+            item: item.clone(),
+            kind: DownloadWarningKind::ChapterEmbedding,
+            message: "Chapter embedding was not fully applied; the downloaded media was retained."
+                .to_string(),
+        });
+    }
+    if warnings.is_empty()
+        && (options.embed_subtitles || options.embed_thumbnail || options.embed_chapters)
+        && (lower.contains("postprocess")
+            || lower.contains("post-process")
+            || lower.contains("embed"))
+    {
+        warnings.push(DownloadWarning {
+            item: item.clone(),
+            kind: DownloadWarningKind::OptionalPostProcessing,
+            message:
+                "Optional media post-processing was not fully applied; the downloaded media was retained."
+                    .to_string(),
+        });
+    }
+    warnings
+}
+
+fn deduplicate_warnings(warnings: &mut Vec<DownloadWarning>) {
+    let mut seen = HashSet::new();
+    warnings.retain(|warning| seen.insert(warning.kind));
 }
 
 fn download_target_args(target: DownloadTarget) -> Vec<OsString> {
@@ -1005,6 +1244,34 @@ async fn move_file(from: &Path, to: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn collect_subtitle_sidecars(dir: &Path, media: &Path) -> Result<Vec<PathBuf>> {
+    const SUBTITLE_EXTENSIONS: [&str; 8] =
+        ["srt", "vtt", "ass", "ssa", "lrc", "ttml", "srv1", "srv3"];
+    let mut entries = fs::read_dir(dir).await?;
+    let mut sidecars = Vec::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path != media
+            && path.extension().is_some_and(|extension| {
+                SUBTITLE_EXTENSIONS
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+            })
+            && entry.file_type().await?.is_file()
+        {
+            sidecars.push(path);
+        }
+    }
+    sidecars.sort();
+    Ok(sidecars)
+}
+
+async fn move_sidecar(sidecar: &Path, destination_dir: &Path) -> Result<PathBuf> {
+    let destination = unique_destination(destination_dir, sidecar).await?;
+    move_file(sidecar, &destination).await?;
+    Ok(destination)
+}
+
 async fn transcode_video(input: &Path, cancellation: &CancellationToken) -> Result<PathBuf> {
     let stem = input
         .file_stem()
@@ -1016,6 +1283,16 @@ async fn transcode_video(input: &Path, cancellation: &CancellationToken) -> Resu
             "-y",
             "-i",
             input.to_string_lossy().as_ref(),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "0:s?",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "0",
             "-c:v",
             "libx264",
             "-crf",
@@ -1028,6 +1305,8 @@ async fn transcode_video(input: &Path, cancellation: &CancellationToken) -> Resu
             "aac",
             "-b:a",
             "128k",
+            "-c:s",
+            "mov_text",
             output.to_string_lossy().as_ref(),
         ])
         .kill_on_drop(true)
@@ -1373,5 +1652,92 @@ mod tests {
 
         assert!(matches!(result, Err(Error::MissingOutputFile)));
         assert!(input.exists());
+    }
+
+    #[test]
+    fn optional_media_arguments_and_unsupported_combinations_are_explicit() {
+        let item = DownloadItem {
+            index: 1,
+            total: 1,
+            title: "Example".to_string(),
+            playlist_index: None,
+        };
+        let options = MediaOptions {
+            write_subtitles: true,
+            embed_subtitles: true,
+            subtitle_languages: vec!["en".to_string(), "ja".to_string()],
+            include_auto_subtitles: true,
+            embed_thumbnail: true,
+            embed_chapters: true,
+        };
+
+        let (video_args, video_warnings) =
+            media_args(&options, Format::Video, Quality::Best, &item);
+        for expected in [
+            "--write-subs",
+            "--write-auto-subs",
+            "--embed-subs",
+            "--embed-thumbnail",
+            "--embed-chapters",
+            "--ignore-errors",
+        ] {
+            assert!(video_args.contains(&OsString::from(expected)), "{expected}");
+        }
+        assert!(video_args
+            .windows(2)
+            .any(|args| args == ["--sub-langs", "en,ja"]));
+        assert!(video_warnings.is_empty());
+
+        let (audio_args, audio_warnings) =
+            media_args(&options, Format::Audio, Quality::Compressed, &item);
+        assert!(!audio_args.contains(&OsString::from("--embed-subs")));
+        assert!(!audio_args.contains(&OsString::from("--embed-chapters")));
+        assert!(audio_warnings
+            .iter()
+            .any(|warning| warning.kind == DownloadWarningKind::SubtitleEmbedding));
+        assert!(audio_warnings
+            .iter()
+            .any(|warning| warning.kind == DownloadWarningKind::ChapterEmbedding));
+    }
+
+    #[test]
+    fn embedding_errors_become_sanitized_warnings() {
+        let item = DownloadItem {
+            index: 1,
+            total: 1,
+            title: "Example".to_string(),
+            playlist_index: None,
+        };
+        let options = MediaOptions {
+            embed_thumbnail: true,
+            ..MediaOptions::default()
+        };
+
+        let warnings = postprocessing_warnings(
+            "ERROR: EmbedThumbnail failed for /private/video.mp4",
+            &options,
+            &item,
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].kind, DownloadWarningKind::ThumbnailEmbedding);
+        assert!(!warnings[0].message.contains("/private/video.mp4"));
+    }
+
+    #[tokio::test]
+    async fn explicit_subtitle_sidecars_are_collected_without_guessing_by_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("video.mp4");
+        let subtitle = dir.path().join("video.en.vtt");
+        fs::write(&media, b"media").await.unwrap();
+        fs::write(&subtitle, b"subtitle").await.unwrap();
+        fs::write(dir.path().join("thumbnail.webp"), b"image")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            collect_subtitle_sidecars(dir.path(), &media).await.unwrap(),
+            [subtitle]
+        );
     }
 }

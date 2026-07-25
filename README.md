@@ -42,6 +42,10 @@ dloor is early-stage OSS software. The local download flow is the primary suppor
 - Reorder, remove, monitor, or cancel queued jobs
 - Keep the latest 500 item results in a local JSON Lines history
 - Retry a failed playlist item without repeating successful items
+- Write selected subtitle sidecars and optionally request subtitle, thumbnail,
+  and chapter embedding
+- Keep a usable media file when optional embedding fails and report the issue as
+  a completion warning
 - Save locally or upload through an optional `rclone` remote
 
 ## Quick Start
@@ -264,6 +268,32 @@ diagnostic log, this file intentionally contains URLs and paths so failed items
 can be retried; protect the config directory as personal data. On Unix, dloor
 creates the history file with owner-only permissions where supported.
 
+Optional media settings are edited in `/settings` and stored with serde defaults,
+so existing configuration files keep all options disabled:
+
+```toml
+[media]
+write_subtitles = true
+embed_subtitles = true
+subtitle_languages = ["en", "ja"]
+include_auto_subtitles = false
+embed_thumbnail = true
+embed_chapters = true
+```
+
+`write_subtitles` preserves subtitle sidecar files. `embed_subtitles` requests
+subtitle embedding for video output and implies subtitle download internally;
+audio output keeps sidecars instead. An empty language list leaves language
+selection to yt-dlp. Automatic subtitles are requested only when subtitle
+writing or embedding is enabled.
+
+Optional embedding uses yt-dlp/ffmpeg post-processing. A subtitle, thumbnail, or
+chapter embedding failure does not discard a successfully downloaded non-empty
+media file; it is shown as a warning on the completion screen. Chapter embedding
+is skipped for compressed MP3 output, and thumbnail embedding is skipped before
+the custom compressed-video transcode, because those combinations cannot be
+retained reliably. Explicit subtitle sidecars are still preserved.
+
 You can reopen the setup screen from inside the app with:
 
 ```text
@@ -300,6 +330,10 @@ Add that line to your shell profile, such as `~/.zshrc` or `~/.bashrc`, if neede
 ### Missing `yt-dlp` or `ffmpeg`
 
 dloor checks for required tools on startup. Install the missing tool, then run `dloor` again.
+When optional embedding is enabled, dloor also inspects ffmpeg's reported
+encoders and muxers. Missing `mov_text`, MOV/MP4, or MP3 capabilities are
+reported as non-blocking warnings; install a full ffmpeg build to enable the
+corresponding embedding path.
 
 ### Cloud Upload Is Unavailable
 

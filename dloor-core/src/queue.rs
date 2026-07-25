@@ -133,7 +133,8 @@ impl DownloadQueue {
             | DownloadEvent::Converting { .. }
             | DownloadEvent::Uploading { .. }
             | DownloadEvent::ItemCompleted { .. }
-            | DownloadEvent::ItemFailed { .. } => {}
+            | DownloadEvent::ItemFailed { .. }
+            | DownloadEvent::ItemWarning { .. } => {}
         }
         false
     }
@@ -265,6 +266,7 @@ mod tests {
                         },
                         error: "failed".to_string(),
                     }],
+                    warnings: Vec::new(),
                 },
             }
         ));
@@ -317,6 +319,7 @@ mod tests {
                 },
                 error: "failed".to_string(),
             }],
+            warnings: Vec::new(),
         };
 
         assert_eq!(
