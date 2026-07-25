@@ -17,6 +17,7 @@ use tracing::{debug, error};
 use crate::{
     config::{
         sanitized_ytdlp_error, BandwidthLimit, Config, CookieSource, Destination, MediaOptions,
+        TranscodePreset,
     },
     detect_platform, DependencyReport, Error, MetadataPreview, Platform, Result,
     YtDlpUpdateOutcome,
@@ -362,7 +363,7 @@ impl DownloadJob {
             })
             .await
             .ok();
-            transcode_video(&downloaded, &self.cancellation).await?
+            transcode_video(&downloaded, &self.config.transcode, &self.cancellation).await?
         } else {
             downloaded
         };
@@ -1367,43 +1368,51 @@ async fn move_sidecar(sidecar: &Path, destination_dir: &Path) -> Result<PathBuf>
     Ok(destination)
 }
 
-async fn transcode_video(input: &Path, cancellation: &CancellationToken) -> Result<PathBuf> {
+fn transcode_args(input: &Path, output: &Path, preset: &TranscodePreset) -> Vec<OsString> {
+    vec![
+        "-y".into(),
+        "-i".into(),
+        input.as_os_str().to_os_string(),
+        "-map".into(),
+        "0:v:0".into(),
+        "-map".into(),
+        "0:a?".into(),
+        "-map".into(),
+        "0:s?".into(),
+        "-map_metadata".into(),
+        "0".into(),
+        "-map_chapters".into(),
+        "0".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-crf".into(),
+        preset.crf.get().to_string().into(),
+        "-preset".into(),
+        preset.preset.as_str().into(),
+        "-vf".into(),
+        format!("scale='min({},iw)':-2", preset.max_width.get()).into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-b:a".into(),
+        format!("{}k", preset.audio_bitrate_kbps.get()).into(),
+        "-c:s".into(),
+        "mov_text".into(),
+        output.as_os_str().to_os_string(),
+    ]
+}
+
+async fn transcode_video(
+    input: &Path,
+    preset: &TranscodePreset,
+    cancellation: &CancellationToken,
+) -> Result<PathBuf> {
     let stem = input
         .file_stem()
         .ok_or_else(|| Error::InvalidPath(input.display().to_string()))?
         .to_string_lossy();
     let output = input.with_file_name(format!("{stem}.compressed.mp4"));
     let mut child = Command::new("ffmpeg")
-        .args([
-            "-y",
-            "-i",
-            input.to_string_lossy().as_ref(),
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-map",
-            "0:s?",
-            "-map_metadata",
-            "0",
-            "-map_chapters",
-            "0",
-            "-c:v",
-            "libx264",
-            "-crf",
-            "28",
-            "-preset",
-            "fast",
-            "-vf",
-            "scale='min(1920,iw)':-2",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-c:s",
-            "mov_text",
-            output.to_string_lossy().as_ref(),
-        ])
+        .args(transcode_args(input, &output, preset))
         .kill_on_drop(true)
         .spawn()?;
     let status = wait_for_process(&mut child, cancellation).await?;
@@ -1861,5 +1870,74 @@ mod tests {
             bandwidth_args(Some(&limit)),
             [OsString::from("--limit-rate"), OsString::from("4.2M")]
         );
+    }
+
+    #[test]
+    fn default_transcode_preset_preserves_existing_ffmpeg_arguments() {
+        let input = Path::new("/tmp/source.mp4");
+        let output = Path::new("/tmp/source.compressed.mp4");
+        let args = transcode_args(input, output, &TranscodePreset::default());
+        let expected = [
+            "-y",
+            "-i",
+            "/tmp/source.mp4",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-map",
+            "0:s?",
+            "-map_metadata",
+            "0",
+            "-map_chapters",
+            "0",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "28",
+            "-preset",
+            "fast",
+            "-vf",
+            "scale='min(1920,iw)':-2",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-c:s",
+            "mov_text",
+            "/tmp/source.compressed.mp4",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
+        assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn custom_transcode_preset_only_changes_validated_values() {
+        let preset = TranscodePreset {
+            crf: crate::Crf::new(20).unwrap(),
+            preset: crate::X264Preset::Slower,
+            max_width: crate::MaxVideoWidth::new(1280).unwrap(),
+            audio_bitrate_kbps: crate::AudioBitrateKbps::new(192).unwrap(),
+        };
+        let args = transcode_args(
+            Path::new("source.mp4"),
+            Path::new("compressed.mp4"),
+            &preset,
+        );
+
+        for pair in [
+            ["-crf", "20"],
+            ["-preset", "slower"],
+            ["-vf", "scale='min(1280,iw)':-2"],
+            ["-b:a", "192k"],
+        ] {
+            assert!(
+                args.windows(2).any(|window| window == pair),
+                "missing {pair:?}"
+            );
+        }
     }
 }

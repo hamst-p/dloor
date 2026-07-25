@@ -113,6 +113,160 @@ pub struct MediaOptions {
     pub embed_chapters: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct Crf(u8);
+
+impl Crf {
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+
+    pub fn new(value: u8) -> std::result::Result<Self, String> {
+        if value <= 51 {
+            Ok(Self(value))
+        } else {
+            Err("transcode.crf must be between 0 and 51".to_string())
+        }
+    }
+}
+
+impl Default for Crf {
+    fn default() -> Self {
+        Self(28)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Crf {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <i64 as serde::Deserialize>::deserialize(deserializer)?;
+        let value = u8::try_from(value)
+            .map_err(|_| serde::de::Error::custom("transcode.crf must be between 0 and 51"))?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum X264Preset {
+    Ultrafast,
+    Superfast,
+    Veryfast,
+    Faster,
+    #[default]
+    Fast,
+    Medium,
+    Slow,
+    Slower,
+    Veryslow,
+    Placebo,
+}
+
+impl X264Preset {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ultrafast => "ultrafast",
+            Self::Superfast => "superfast",
+            Self::Veryfast => "veryfast",
+            Self::Faster => "faster",
+            Self::Fast => "fast",
+            Self::Medium => "medium",
+            Self::Slow => "slow",
+            Self::Slower => "slower",
+            Self::Veryslow => "veryslow",
+            Self::Placebo => "placebo",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct MaxVideoWidth(u16);
+
+impl MaxVideoWidth {
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    pub fn new(value: u16) -> std::result::Result<Self, String> {
+        if (16..=1920).contains(&value) && value.is_multiple_of(2) {
+            Ok(Self(value))
+        } else {
+            Err("transcode.max_width must be an even integer between 16 and 1920".to_string())
+        }
+    }
+}
+
+impl Default for MaxVideoWidth {
+    fn default() -> Self {
+        Self(1920)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MaxVideoWidth {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <i64 as serde::Deserialize>::deserialize(deserializer)?;
+        let value = u16::try_from(value).map_err(|_| {
+            serde::de::Error::custom(
+                "transcode.max_width must be an even integer between 16 and 1920",
+            )
+        })?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct AudioBitrateKbps(u16);
+
+impl AudioBitrateKbps {
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    pub fn new(value: u16) -> std::result::Result<Self, String> {
+        if (8..=512).contains(&value) {
+            Ok(Self(value))
+        } else {
+            Err("transcode.audio_bitrate_kbps must be between 8 and 512".to_string())
+        }
+    }
+}
+
+impl Default for AudioBitrateKbps {
+    fn default() -> Self {
+        Self(128)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AudioBitrateKbps {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <i64 as serde::Deserialize>::deserialize(deserializer)?;
+        let value = u16::try_from(value).map_err(|_| {
+            serde::de::Error::custom("transcode.audio_bitrate_kbps must be between 8 and 512")
+        })?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranscodePreset {
+    pub crf: Crf,
+    pub preset: X264Preset,
+    pub max_width: MaxVideoWidth,
+    pub audio_bitrate_kbps: AudioBitrateKbps,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(transparent)]
 pub struct BandwidthLimit(String);
@@ -183,6 +337,7 @@ pub struct Config {
     pub clipboard_autofill: bool,
     pub media: MediaOptions,
     pub bandwidth_limit: Option<BandwidthLimit>,
+    pub transcode: TranscodePreset,
 }
 
 #[derive(serde::Deserialize)]
@@ -201,6 +356,8 @@ struct ConfigFile {
     media: MediaOptions,
     #[serde(default)]
     bandwidth_limit: Option<BandwidthLimit>,
+    #[serde(default)]
+    transcode: TranscodePreset,
 }
 
 impl<'de> serde::Deserialize<'de> for Config {
@@ -222,6 +379,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             clipboard_autofill: file.clipboard_autofill,
             media: file.media,
             bandwidth_limit: file.bandwidth_limit,
+            transcode: file.transcode,
         })
     }
 }
@@ -238,6 +396,7 @@ impl Default for Config {
             clipboard_autofill: default_clipboard_autofill(),
             media: MediaOptions::default(),
             bandwidth_limit: None,
+            transcode: TranscodePreset::default(),
         }
     }
 }
@@ -396,6 +555,12 @@ mod tests {
                 embed_chapters: true,
             },
             bandwidth_limit: Some("4.2m".parse().unwrap()),
+            transcode: TranscodePreset {
+                crf: Crf::new(24).unwrap(),
+                preset: X264Preset::Slow,
+                max_width: MaxVideoWidth::new(1280).unwrap(),
+                audio_bitrate_kbps: AudioBitrateKbps::new(192).unwrap(),
+            },
         };
 
         config.save_to(&path).unwrap();
@@ -420,6 +585,7 @@ path = "/tmp"
         assert!(config.clipboard_autofill);
         assert_eq!(config.media, MediaOptions::default());
         assert_eq!(config.bandwidth_limit, None);
+        assert_eq!(config.transcode, TranscodePreset::default());
     }
 
     #[test]
@@ -446,9 +612,87 @@ path = "/tmp"
         assert!(config.clipboard_autofill);
         assert_eq!(config.media, MediaOptions::default());
         assert_eq!(config.bandwidth_limit, None);
+        assert_eq!(config.transcode, TranscodePreset::default());
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("[cookies]"));
         assert!(!serialized.contains("browser = \"firefox\"\n\n[destination]"));
+    }
+
+    #[test]
+    fn partial_transcode_preset_uses_current_defaults() {
+        let config: Config = toml::from_str(
+            r#"
+default_quality = "Compressed"
+
+[destination]
+type = "local"
+path = "/tmp"
+
+[transcode]
+crf = 22
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.transcode.crf, Crf::new(22).unwrap());
+        assert_eq!(config.transcode.preset, X264Preset::Fast);
+        assert_eq!(
+            config.transcode.max_width,
+            MaxVideoWidth::new(1920).unwrap()
+        );
+        assert_eq!(
+            config.transcode.audio_bitrate_kbps,
+            AudioBitrateKbps::new(128).unwrap()
+        );
+    }
+
+    #[test]
+    fn transcode_preset_rejects_out_of_range_and_unlisted_values() {
+        for setting in [
+            "crf = -1",
+            "crf = 52",
+            "preset = \"-i\"",
+            "preset = \"turbo\"",
+            "max_width = 15",
+            "max_width = 1919",
+            "max_width = 1922",
+            "audio_bitrate_kbps = 7",
+            "audio_bitrate_kbps = 513",
+        ] {
+            let raw = format!(
+                r#"
+default_quality = "Compressed"
+
+[destination]
+type = "local"
+path = "/tmp"
+
+[transcode]
+{setting}
+"#
+            );
+
+            assert!(
+                toml::from_str::<Config>(&raw).is_err(),
+                "{setting} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn transcode_preset_rejects_unknown_fields() {
+        let raw = r#"
+default_quality = "Compressed"
+
+[destination]
+type = "local"
+path = "/tmp"
+
+[transcode]
+extra_args = ["-i", "unexpected"]
+"#;
+
+        assert!(toml::from_str::<Config>(raw).is_err());
     }
 
     #[test]

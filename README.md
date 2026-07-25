@@ -238,7 +238,9 @@ the active process and discards waiting jobs before the application exits.
 ## Quality Presets
 
 - Video / Best: downloads `bestvideo*+bestaudio/best` and merges to mp4
-- Video / Compressed: downloads up to 1080p, then re-encodes with `ffmpeg` using `libx264 -crf 28 -preset fast`; the pre-transcode source file is removed after a successful conversion
+- Video / Compressed: downloads up to 1080p, then re-encodes with `ffmpeg`
+  using the validated `[transcode]` preset; the pre-transcode source file is
+  removed after a successful conversion
 - Video / 720p, 1080p, 1440p, or 2160p: chooses the highest available
   video stream at or below the selected height and merges the best audio
 - Audio / Best: extracts m4a at best available quality
@@ -270,6 +272,24 @@ Existing `"Best"` and `"Compressed"` values remain valid. Resolution defaults
 use `"720p"`, `"1080p"`, `"1440p"`, or `"2160p"`. If a configured resolution is
 not available on the current single-video preview, the Quality screen selects
 Best and explains why.
+
+The active Video / Compressed preset can be adjusted with structured values:
+
+```toml
+[transcode]
+crf = 28
+preset = "fast"
+max_width = 1920
+audio_bitrate_kbps = 128
+```
+
+The defaults above preserve the original output. `crf` must be between 0 and
+51, `max_width` must be an even value from 16 through 1920, and
+`audio_bitrate_kbps` must be from 8 through 512. `preset` is restricted to the
+known x264 preset names. Arbitrary codec names, filter expressions, and extra
+ffmpeg arguments are deliberately not accepted. Existing configurations that
+omit `[transcode]`, as well as partially specified presets, receive the current
+defaults for every missing value.
 
 An optional `bandwidth_limit` accepts positive byte rates such as `"50K"`,
 `"4.2M"`, `"1G"`, or an integer byte count:

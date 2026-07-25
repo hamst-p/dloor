@@ -13,7 +13,10 @@ pub mod metadata;
 pub mod platform;
 pub mod queue;
 
-pub use config::{BandwidthLimit, Browser, Config, CookieSource, Destination, MediaOptions};
+pub use config::{
+    AudioBitrateKbps, BandwidthLimit, Browser, Config, CookieSource, Crf, Destination,
+    MaxVideoWidth, MediaOptions, TranscodePreset, X264Preset,
+};
 pub use deps::{
     check_dependencies, check_dependency_presence, check_media_capabilities, parse_ffmpeg_version,
     parse_yt_dlp_version, update_hint, DependencyJob, DependencyReport, FfmpegVersion,
