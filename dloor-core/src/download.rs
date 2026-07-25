@@ -197,37 +197,41 @@ impl DownloadJob {
             .ok_or_else(|| Error::ProcessFailed("failed to capture yt-dlp stderr".to_string()))?;
 
         let mut stdout_lines = BufReader::new(stdout).lines();
-        let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            let mut collected = Vec::new();
-            while let Ok(Some(line)) = lines.next_line().await {
-                collected.push(line);
-            }
-            collected.join("\n")
-        });
-
+        let mut stderr_lines = BufReader::new(stderr).lines();
         let mut output_path = None;
+        let mut stderr_messages = Vec::new();
         let expected_parts = usize::from(self.request.format == Format::Video) + 1;
         let mut progress_tracker = ProgressTracker::new(expected_parts);
-        loop {
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        while stdout_open || stderr_open {
             tokio::select! {
                 _ = self.cancellation.cancelled() => {
                     child.kill().await.ok();
-                    let _ = stderr_task.await;
                     return Err(Error::Cancelled);
                 }
-                line = stdout_lines.next_line() => {
+                line = stdout_lines.next_line(), if stdout_open => {
                     match line? {
                         Some(line) => {
                             if let Some(path) = parse_output_line(&line) {
                                 output_path = Some(path);
-                            } else if let Some(progress) = progress_tracker.update(&line) {
+                            }
+                        }
+                        None => stdout_open = false,
+                    }
+                }
+                line = stderr_lines.next_line(), if stderr_open => {
+                    match line? {
+                        Some(line) => {
+                            if let Some(progress) = progress_tracker.update(&line) {
                                 tx.send(DownloadEvent::Progress { progress, platform })
                                     .await
                                     .ok();
+                            } else {
+                                stderr_messages.push(line);
                             }
                         }
-                        None => break,
+                        None => stderr_open = false,
                     }
                 }
             }
@@ -236,12 +240,11 @@ impl DownloadJob {
         let status = tokio::select! {
             _ = self.cancellation.cancelled() => {
                 child.kill().await.ok();
-                let _ = stderr_task.await;
                 return Err(Error::Cancelled);
             }
             status = child.wait() => status?,
         };
-        let stderr = stderr_task.await.unwrap_or_default();
+        let stderr = stderr_messages.join("\n");
         if !status.success() {
             return Err(Error::ProcessFailed(if stderr.trim().is_empty() {
                 format!("yt-dlp exited with {status}")
@@ -706,6 +709,11 @@ mod tests {
         assert_eq!(
             parse_output_line("DLOOR_OUTPUT|/tmp/video name.mp4"),
             Some(PathBuf::from("/tmp/video name.mp4"))
+        );
+        assert_eq!(
+            parse_output_line("[download] /tmp/unrelated.mp4"),
+            None,
+            "only the dedicated after_move record may select the output"
         );
     }
 
