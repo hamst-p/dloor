@@ -176,6 +176,7 @@ Then enter the remote name and remote path in dloor's setup screen.
 - `/quit`: quit
 - `q`: quit from the URL input or completion screen
 - `Esc`: go back, or quit from the URL input screen
+- `Esc` during a download: cancel the active `yt-dlp`, `ffmpeg`, or `rclone` process
 - Arrow keys: move between choices
 - `Tab`: move between setup fields
 - `Enter`: confirm
@@ -183,7 +184,7 @@ Then enter the remote name and remote path in dloor's setup screen.
 ## Quality Presets
 
 - Video / Best: downloads `bestvideo*+bestaudio/best` and merges to mp4
-- Video / Compressed: downloads up to 1080p, then re-encodes with `ffmpeg` using `libx264 -crf 28 -preset fast`
+- Video / Compressed: downloads up to 1080p, then re-encodes with `ffmpeg` using `libx264 -crf 28 -preset fast`; the pre-transcode source file is removed after a successful conversion
 - Audio / Best: extracts m4a at best available quality
 - Audio / Compressed: extracts mp3 with `--audio-quality 5`
 
@@ -195,6 +196,14 @@ Typical locations:
 
 - macOS: `~/Library/Application Support/com.dloor.dloor-tui/config.toml`
 - Linux: `~/.config/dloor-tui/config.toml` or the path selected by your XDG environment
+
+The `default_quality` value controls the initial selection on each Quality screen:
+
+```toml
+default_quality = "Compressed"
+```
+
+Runtime diagnostics are appended to `dloor.log` beside `config.toml`. Set `RUST_LOG` when you need a different log level; dloor logs its own crates at `debug` by default.
 
 You can reopen the setup screen from inside the app with:
 

@@ -301,7 +301,7 @@ fn render_download(frame: &mut Frame<'_>, app: &App) {
         },
     );
     frame.render_widget(Paragraph::new(detail).alignment(Alignment::Center), body[2]);
-    render_footer(frame, chunks[2], "Download runs asynchronously");
+    render_footer(frame, chunks[2], "Esc: cancel download");
 }
 
 fn render_complete(frame: &mut Frame<'_>, app: &App) {

@@ -87,10 +87,18 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn config_path() -> Result<PathBuf> {
+    pub fn config_dir() -> Result<PathBuf> {
         let dirs =
             ProjectDirs::from("com", "dloor", "dloor-tui").ok_or(Error::ConfigDirUnavailable)?;
-        Ok(dirs.config_dir().join("config.toml"))
+        Ok(dirs.config_dir().to_path_buf())
+    }
+
+    pub fn config_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("config.toml"))
+    }
+
+    pub fn log_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("dloor.log"))
     }
 
     pub fn exists() -> bool {

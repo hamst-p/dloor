@@ -11,13 +11,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(io::sink)
-        .init();
+    let _log_guard = init_logging()?;
 
     let mut app = App::new()?;
     if let Some(message) = app.startup_error() {
@@ -42,6 +40,32 @@ async fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    let log_path = dloor_core::Config::log_path()?;
+    let log_dir = log_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid log path: {}", log_path.display()))?;
+    std::fs::create_dir_all(log_dir)?;
+    let file_name = log_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid log path: {}", log_path.display()))?;
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::NEVER)
+        .filename_prefix(file_name.to_string_lossy())
+        .build(log_dir)?;
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    let filter = std::env::var(EnvFilter::DEFAULT_ENV)
+        .map(EnvFilter::new)
+        .unwrap_or_else(|_| EnvFilter::new("dloor=debug,dloor_core=debug"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(writer)
+        .init();
+    tracing::debug!(path = %log_path.display(), "file logging initialized");
+    Ok(guard)
 }
 
 async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {

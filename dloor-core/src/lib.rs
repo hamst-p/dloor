@@ -35,6 +35,8 @@ pub enum Error {
     MissingTool(&'static str),
     #[error("process failed: {0}")]
     ProcessFailed(String),
+    #[error("download cancelled")]
+    Cancelled,
     #[error("download produced no output file")]
     MissingOutputFile,
     #[error("invalid path: {0}")]

@@ -6,6 +6,7 @@ use dloor_core::{
     Quality,
 };
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -62,6 +63,7 @@ pub struct App {
     pub completed_path: String,
     pub error_message: String,
     pub download_rx: Option<mpsc::Receiver<DownloadEvent>>,
+    pub download_cancellation: Option<CancellationToken>,
     pub spinner_index: usize,
     pub should_quit: bool,
     startup_error: Option<String>,
@@ -80,6 +82,7 @@ impl App {
             .any(|tool| tool.command() == "rclone");
 
         let setup = SetupState::from_config(&config, rclone_available);
+        let selected_quality = quality_index(config.default_quality);
         Ok(Self {
             screen: if first_run {
                 Screen::Setup
@@ -91,13 +94,14 @@ impl App {
             setup,
             url_input: String::new(),
             selected_format: 0,
-            selected_quality: 0,
+            selected_quality,
             selected_platform: None,
             progress: None,
             status_text: "Ready".to_string(),
             completed_path: String::new(),
             error_message: String::new(),
             download_rx: None,
+            download_cancellation: None,
             spinner_index: 0,
             should_quit: false,
             startup_error,
@@ -123,6 +127,9 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if let Some(cancellation) = &self.download_cancellation {
+                cancellation.cancel();
+            }
             return AppAction::Quit;
         }
 
@@ -132,7 +139,7 @@ impl App {
             Screen::HowToUse => self.handle_how_to_use_key(key),
             Screen::Format => self.handle_select_key(key, Screen::Quality, 2),
             Screen::Quality => self.handle_quality_key(key),
-            Screen::Download => AppAction::Continue,
+            Screen::Download => self.handle_download_key(key),
             Screen::Complete => self.handle_complete_key(key),
             Screen::Error => self.handle_error_key(key),
         }
@@ -205,6 +212,7 @@ impl App {
                 match detect_platform(&input) {
                     Ok(platform) => {
                         self.selected_platform = Some(platform);
+                        self.selected_quality = quality_index(self.config.default_quality);
                         self.screen = Screen::Format;
                     }
                     Err(error) => self.show_error(error.to_string()),
@@ -250,6 +258,16 @@ impl App {
             KeyCode::Down | KeyCode::Right => self.move_selection(2, true),
             KeyCode::Enter => self.start_download(),
             _ => {}
+        }
+        AppAction::Continue
+    }
+
+    fn handle_download_key(&mut self, key: KeyEvent) -> AppAction {
+        if key.code == KeyCode::Esc {
+            if let Some(cancellation) = &self.download_cancellation {
+                cancellation.cancel();
+                self.status_text = "Cancelling...".to_string();
+            }
         }
         AppAction::Continue
     }
@@ -305,6 +323,7 @@ impl App {
             },
         };
         let job = DownloadJob::new(request, self.config.clone());
+        self.download_cancellation = Some(job.cancellation_token());
         self.download_rx = Some(job.spawn());
         self.progress = None;
         self.status_text = "Starting download...".to_string();
@@ -323,11 +342,20 @@ impl App {
             DownloadEvent::Completed { path } => {
                 self.completed_path = path;
                 self.download_rx = None;
+                self.download_cancellation = None;
                 self.screen = Screen::Complete;
             }
             DownloadEvent::Failed { error } => {
                 self.download_rx = None;
+                self.download_cancellation = None;
                 self.show_error(error);
+            }
+            DownloadEvent::Cancelled => {
+                self.download_rx = None;
+                self.download_cancellation = None;
+                self.progress = None;
+                self.status_text = "Download cancelled".to_string();
+                self.screen = Screen::Main;
             }
         }
     }
@@ -430,6 +458,13 @@ impl App {
             }
             SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
         }
+    }
+}
+
+fn quality_index(quality: Quality) -> usize {
+    match quality {
+        Quality::Best => 0,
+        Quality::Compressed => 1,
     }
 }
 
