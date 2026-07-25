@@ -8,16 +8,47 @@ use dloor_core::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Screen {
-    Setup,
-    Main,
+    Setup(SetupState),
+    Main(MainState),
     HowToUse,
-    Format,
-    Quality,
-    Download,
-    Complete,
-    Error,
+    Format(FormatState),
+    Quality(QualityState),
+    Download(DownloadViewState),
+    Complete(CompleteState),
+    Error(ErrorState),
+}
+
+#[derive(Debug, Default)]
+pub struct MainState {
+    pub url_input: String,
+}
+
+#[derive(Debug)]
+pub struct FormatState {
+    pub url: String,
+    pub selected: usize,
+}
+
+#[derive(Debug)]
+pub struct QualityState {
+    pub url: String,
+    pub format: Format,
+    pub selected: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct DownloadViewState;
+
+#[derive(Debug)]
+pub struct CompleteState {
+    pub path: String,
+}
+
+#[derive(Debug)]
+pub struct ErrorState {
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +67,7 @@ pub enum SetupField {
     Browser,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SetupState {
     pub cloud: bool,
     pub field: SetupField,
@@ -45,28 +76,55 @@ pub struct SetupState {
     pub remote_path: String,
     pub use_browser_cookies: bool,
     pub browser_index: usize,
+}
+
+#[derive(Debug)]
+pub struct SharedState {
+    pub config: Config,
+    pub first_run: bool,
     pub rclone_available: bool,
+    pub spinner_index: usize,
+    pub active_download: Option<ActiveDownload>,
+    startup_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct ActiveDownload {
+    pub platform: Option<Platform>,
+    pub progress: Option<DownloadProgress>,
+    pub status_text: String,
+    receiver: mpsc::Receiver<DownloadEvent>,
+    cancellation: CancellationToken,
+}
+
+#[derive(Debug)]
+pub struct Navigation {
+    pub current: Screen,
+    back_stack: Vec<Screen>,
+}
+
+#[derive(Debug)]
+enum Transition {
+    Stay,
+    Push(Screen),
+    Replace(Screen),
+    Back,
+    ReturnToMain { clear_input: bool },
+    ShowError(String),
+    Quit,
+}
+
+#[derive(Debug)]
+enum DownloadTerminal {
+    Completed(String),
+    Failed(String),
+    Cancelled,
 }
 
 #[derive(Debug)]
 pub struct App {
-    pub screen: Screen,
-    pub config: Config,
-    pub first_run: bool,
-    pub setup: SetupState,
-    pub url_input: String,
-    pub selected_format: usize,
-    pub selected_quality: usize,
-    pub selected_platform: Option<Platform>,
-    pub progress: Option<DownloadProgress>,
-    pub status_text: String,
-    pub completed_path: String,
-    pub error_message: String,
-    pub download_rx: Option<mpsc::Receiver<DownloadEvent>>,
-    pub download_cancellation: Option<CancellationToken>,
-    pub spinner_index: usize,
-    pub should_quit: bool,
-    startup_error: Option<String>,
+    pub shared: SharedState,
+    pub navigation: Navigation,
 }
 
 impl App {
@@ -80,384 +138,358 @@ impl App {
             .iter()
             .chain(report.missing_required.iter())
             .any(|tool| tool.command() == "rclone");
+        let initial_screen = if first_run {
+            Screen::Setup(SetupState::from_config(&config, rclone_available))
+        } else {
+            Screen::Main(MainState::default())
+        };
 
-        let setup = SetupState::from_config(&config, rclone_available);
-        let selected_quality = quality_index(config.default_quality);
         Ok(Self {
-            screen: if first_run {
-                Screen::Setup
-            } else {
-                Screen::Main
+            shared: SharedState {
+                config,
+                first_run,
+                rclone_available,
+                spinner_index: 0,
+                active_download: None,
+                startup_error,
             },
-            config,
-            first_run,
-            setup,
-            url_input: String::new(),
-            selected_format: 0,
-            selected_quality,
-            selected_platform: None,
-            progress: None,
-            status_text: "Ready".to_string(),
-            completed_path: String::new(),
-            error_message: String::new(),
-            download_rx: None,
-            download_cancellation: None,
-            spinner_index: 0,
-            should_quit: false,
-            startup_error,
+            navigation: Navigation::new(initial_screen),
         })
     }
 
     pub fn startup_error(&self) -> Option<&str> {
-        self.startup_error.as_deref()
+        self.shared.startup_error.as_deref()
     }
 
     pub fn tick(&mut self) {
-        self.spinner_index = self.spinner_index.wrapping_add(1);
-        let mut events = Vec::new();
-        if let Some(rx) = &mut self.download_rx {
-            while let Ok(event) = rx.try_recv() {
-                events.push(event);
+        self.shared.spinner_index = self.shared.spinner_index.wrapping_add(1);
+        let terminal = self.shared.poll_download();
+        match terminal {
+            Some(DownloadTerminal::Completed(path)) => {
+                self.navigation
+                    .replace(Screen::Complete(CompleteState { path }));
             }
-        }
-        for event in events {
-            self.apply_download_event(event);
+            Some(DownloadTerminal::Failed(error)) => self.navigation.show_error(error),
+            Some(DownloadTerminal::Cancelled) => {
+                self.navigation.return_to_main(false);
+            }
+            None => {}
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if let Some(cancellation) = &self.download_cancellation {
-                cancellation.cancel();
-            }
+            self.shared.cancel_active_download();
             return AppAction::Quit;
         }
 
-        match self.screen {
-            Screen::Setup => self.handle_setup_key(key),
-            Screen::Main => self.handle_main_key(key),
-            Screen::HowToUse => self.handle_how_to_use_key(key),
-            Screen::Format => self.handle_select_key(key, Screen::Quality, 2),
-            Screen::Quality => self.handle_quality_key(key),
-            Screen::Download => self.handle_download_key(key),
-            Screen::Complete => self.handle_complete_key(key),
-            Screen::Error => self.handle_error_key(key),
-        }
+        let transition = match &mut self.navigation.current {
+            Screen::Setup(state) => handle_setup_key(state, &mut self.shared, key),
+            Screen::Main(state) => handle_main_key(state, &mut self.shared, key),
+            Screen::HowToUse => handle_how_to_use_key(key),
+            Screen::Format(state) => handle_format_key(state, &self.shared, key),
+            Screen::Quality(state) => handle_quality_key(state, &mut self.shared, key),
+            Screen::Download(_) => handle_download_key(&mut self.shared, key),
+            Screen::Complete(_) => handle_complete_key(key),
+            Screen::Error(_) => handle_error_key(key),
+        };
+        self.apply_transition(transition)
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        match self.screen {
-            Screen::Setup => {
+        match &mut self.navigation.current {
+            Screen::Setup(state) => {
                 for ch in text.chars().filter(|ch| !ch.is_control()) {
-                    self.push_setup_char(ch);
+                    state.push_char(ch);
                 }
             }
-            Screen::Main => self.url_input.push_str(text.trim()),
+            Screen::Main(state) => state.url_input.push_str(text.trim()),
             _ => {}
         }
     }
 
-    fn handle_setup_key(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
-            KeyCode::Esc if !self.first_run => self.screen = Screen::Main,
-            KeyCode::Tab | KeyCode::Down => self.next_setup_field(),
-            KeyCode::BackTab | KeyCode::Up => self.prev_setup_field(),
-            KeyCode::Left | KeyCode::Right if self.setup.field == SetupField::Destination => {
-                self.setup.cloud = !self.setup.cloud && self.setup.rclone_available;
-            }
-            KeyCode::Left | KeyCode::Right
-                if self.setup.field == SetupField::BrowserAuthentication =>
-            {
-                self.setup.use_browser_cookies = !self.setup.use_browser_cookies;
-            }
-            KeyCode::Left if self.setup.field == SetupField::Browser => {
-                self.setup.browser_index =
-                    (self.setup.browser_index + Browser::ALL.len() - 1) % Browser::ALL.len();
-            }
-            KeyCode::Right if self.setup.field == SetupField::Browser => {
-                self.setup.browser_index = (self.setup.browser_index + 1) % Browser::ALL.len();
-            }
-            KeyCode::Enter => {
-                if let Err(error) = self.save_setup() {
-                    self.show_error(error.to_string());
-                }
-            }
-            KeyCode::Backspace => self.backspace_setup_field(),
-            KeyCode::Char(ch) => self.push_setup_char(ch),
-            _ => {}
-        }
-        AppAction::Continue
-    }
-
-    fn handle_main_key(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
-            KeyCode::Esc => AppAction::Quit,
-            KeyCode::Char('q') if self.url_input.is_empty() => AppAction::Quit,
-            KeyCode::Enter => {
-                let input = self.url_input.trim().to_string();
-                if input == "/quit" {
+    fn apply_transition(&mut self, transition: Transition) -> AppAction {
+        match transition {
+            Transition::Stay => {}
+            Transition::Push(screen) => self.navigation.push(screen),
+            Transition::Replace(screen) => self.navigation.replace(screen),
+            Transition::Back => {
+                if !self.navigation.back() {
                     return AppAction::Quit;
                 }
-                if input == "/settings" {
-                    self.setup = SetupState::from_config(&self.config, self.setup.rclone_available);
-                    self.screen = Screen::Setup;
-                    self.url_input.clear();
-                    return AppAction::Continue;
-                }
-                if input == "/howtouse" {
-                    self.screen = Screen::HowToUse;
-                    self.url_input.clear();
-                    return AppAction::Continue;
-                }
-                match detect_platform(&input) {
-                    Ok(platform) => {
-                        self.selected_platform = Some(platform);
-                        self.selected_quality = quality_index(self.config.default_quality);
-                        self.screen = Screen::Format;
-                    }
-                    Err(error) => self.show_error(error.to_string()),
-                }
-                AppAction::Continue
             }
-            KeyCode::Backspace => {
-                self.url_input.pop();
-                AppAction::Continue
+            Transition::ReturnToMain { clear_input } => {
+                self.navigation.return_to_main(clear_input);
             }
-            KeyCode::Char(ch) => {
-                self.url_input.push(ch);
-                AppAction::Continue
-            }
-            _ => AppAction::Continue,
-        }
-    }
-
-    fn handle_how_to_use_key(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
-            KeyCode::Enter | KeyCode::Esc => self.screen = Screen::Main,
-            KeyCode::Char('q') => return AppAction::Quit,
-            _ => {}
+            Transition::ShowError(message) => self.navigation.show_error(message),
+            Transition::Quit => return AppAction::Quit,
         }
         AppAction::Continue
     }
+}
 
-    fn handle_select_key(&mut self, key: KeyEvent, next: Screen, count: usize) -> AppAction {
-        match key.code {
-            KeyCode::Esc => self.screen = Screen::Main,
-            KeyCode::Up | KeyCode::Left => self.move_selection(count, false),
-            KeyCode::Down | KeyCode::Right => self.move_selection(count, true),
-            KeyCode::Enter => self.screen = next,
-            _ => {}
-        }
-        AppAction::Continue
-    }
-
-    fn handle_quality_key(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
-            KeyCode::Esc => self.screen = Screen::Format,
-            KeyCode::Up | KeyCode::Left => self.move_selection(2, false),
-            KeyCode::Down | KeyCode::Right => self.move_selection(2, true),
-            KeyCode::Enter => self.start_download(),
-            _ => {}
-        }
-        AppAction::Continue
-    }
-
-    fn handle_download_key(&mut self, key: KeyEvent) -> AppAction {
-        if key.code == KeyCode::Esc {
-            if let Some(cancellation) = &self.download_cancellation {
-                cancellation.cancel();
-                self.status_text = "Cancelling...".to_string();
-            }
-        }
-        AppAction::Continue
-    }
-
-    fn handle_complete_key(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
-            KeyCode::Enter => {
-                self.url_input.clear();
-                self.progress = None;
-                self.status_text = "Ready".to_string();
-                self.screen = Screen::Main;
-            }
-            KeyCode::Char('q') | KeyCode::Esc => return AppAction::Quit,
-            _ => {}
-        }
-        AppAction::Continue
-    }
-
-    fn handle_error_key(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
-            KeyCode::Enter | KeyCode::Esc => self.screen = Screen::Main,
-            KeyCode::Char('q') => return AppAction::Quit,
-            _ => {}
-        }
-        AppAction::Continue
-    }
-
-    fn move_selection(&mut self, count: usize, forward: bool) {
-        let selection = match self.screen {
-            Screen::Format => &mut self.selected_format,
-            Screen::Quality => &mut self.selected_quality,
-            _ => return,
-        };
-        if forward {
-            *selection = (*selection + 1) % count;
-        } else {
-            *selection = (*selection + count - 1) % count;
-        }
-    }
-
-    fn start_download(&mut self) {
-        let request = DownloadRequest {
-            url: self.url_input.trim().to_string(),
-            format: if self.selected_format == 0 {
-                Format::Video
-            } else {
-                Format::Audio
-            },
-            quality: if self.selected_quality == 0 {
-                Quality::Best
-            } else {
-                Quality::Compressed
-            },
-        };
+impl SharedState {
+    fn start_download(&mut self, request: DownloadRequest) {
+        let platform = detect_platform(&request.url).ok();
         let job = DownloadJob::new(request, self.config.clone());
-        self.download_cancellation = Some(job.cancellation_token());
-        self.download_rx = Some(job.spawn());
-        self.progress = None;
-        self.status_text = "Starting download...".to_string();
-        self.screen = Screen::Download;
+        let cancellation = job.cancellation_token();
+        self.active_download = Some(ActiveDownload {
+            platform,
+            progress: None,
+            status_text: "Starting download...".to_string(),
+            receiver: job.spawn(),
+            cancellation,
+        });
     }
 
-    fn apply_download_event(&mut self, event: DownloadEvent) {
-        match event {
-            DownloadEvent::Progress { progress, platform } => {
-                self.selected_platform = Some(platform);
-                self.status_text = "Downloading".to_string();
-                self.progress = Some(progress);
+    fn poll_download(&mut self) -> Option<DownloadTerminal> {
+        let active = self.active_download.as_mut()?;
+        let mut terminal = None;
+        while let Ok(event) = active.receiver.try_recv() {
+            match event {
+                DownloadEvent::Progress { progress, platform } => {
+                    active.platform = Some(platform);
+                    active.status_text = "Downloading".to_string();
+                    active.progress = Some(progress);
+                }
+                DownloadEvent::Converting => {
+                    active.status_text = "Converting...".to_string();
+                }
+                DownloadEvent::Uploading => {
+                    active.status_text = "Uploading...".to_string();
+                }
+                DownloadEvent::Completed { path } => {
+                    terminal = Some(DownloadTerminal::Completed(path));
+                }
+                DownloadEvent::Failed { error } => {
+                    terminal = Some(DownloadTerminal::Failed(error));
+                }
+                DownloadEvent::Cancelled => {
+                    terminal = Some(DownloadTerminal::Cancelled);
+                }
             }
-            DownloadEvent::Converting => self.status_text = "Converting...".to_string(),
-            DownloadEvent::Uploading => self.status_text = "Uploading...".to_string(),
-            DownloadEvent::Completed { path } => {
-                self.completed_path = path;
-                self.download_rx = None;
-                self.download_cancellation = None;
-                self.screen = Screen::Complete;
-            }
-            DownloadEvent::Failed { error } => {
-                self.download_rx = None;
-                self.download_cancellation = None;
-                self.show_error(error);
-            }
-            DownloadEvent::Cancelled => {
-                self.download_rx = None;
-                self.download_cancellation = None;
-                self.progress = None;
-                self.status_text = "Download cancelled".to_string();
-                self.screen = Screen::Main;
-            }
+        }
+        if terminal.is_some() {
+            self.active_download = None;
+        }
+        terminal
+    }
+
+    fn cancel_active_download(&mut self) {
+        if let Some(active) = &mut self.active_download {
+            active.cancellation.cancel();
+            active.status_text = "Cancelling...".to_string();
+        }
+    }
+}
+
+impl Navigation {
+    fn new(current: Screen) -> Self {
+        Self {
+            current,
+            back_stack: Vec::new(),
         }
     }
 
-    fn save_setup(&mut self) -> Result<()> {
-        let destination = if self.setup.cloud {
-            Destination::Cloud {
-                remote: self.setup.remote.trim().to_string(),
-                path: self.setup.remote_path.trim().trim_matches('/').to_string(),
-            }
-        } else {
-            Destination::Local {
-                path: self.setup.local_path.trim().into(),
-            }
+    fn push(&mut self, screen: Screen) {
+        let previous = std::mem::replace(&mut self.current, screen);
+        self.back_stack.push(previous);
+    }
+
+    fn replace(&mut self, screen: Screen) {
+        self.current = screen;
+    }
+
+    fn back(&mut self) -> bool {
+        let Some(previous) = self.back_stack.pop() else {
+            return false;
         };
-        self.config.destination = destination;
-        self.config.browser = self
-            .setup
-            .use_browser_cookies
-            .then(|| Browser::ALL[self.setup.browser_index]);
-        self.config.save()?;
-        self.first_run = false;
-        self.screen = Screen::Main;
-        Ok(())
+        self.current = previous;
+        true
+    }
+
+    fn return_to_main(&mut self, clear_input: bool) {
+        let mut main = self
+            .back_stack
+            .drain(..)
+            .find_map(|screen| match screen {
+                Screen::Main(state) => Some(state),
+                _ => None,
+            })
+            .or_else(
+                || match std::mem::replace(&mut self.current, Screen::HowToUse) {
+                    Screen::Main(state) => Some(state),
+                    _ => None,
+                },
+            )
+            .unwrap_or_default();
+        if clear_input {
+            main.url_input.clear();
+        }
+        self.current = Screen::Main(main);
+        self.back_stack.clear();
     }
 
     fn show_error(&mut self, message: String) {
-        self.error_message = message;
-        self.screen = Screen::Error;
+        self.return_to_main(false);
+        self.push(Screen::Error(ErrorState { message }));
     }
+}
 
-    pub fn destination_label(&self) -> String {
-        match &self.config.destination {
-            Destination::Local { path } => format!("local: {}", path.to_string_lossy()),
-            Destination::Cloud { remote, .. } => format!("cloud: Google Drive ({remote})"),
+fn handle_setup_key(state: &mut SetupState, shared: &mut SharedState, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Esc if !shared.first_run => return Transition::Back,
+        KeyCode::Tab | KeyCode::Down => state.next_field(),
+        KeyCode::BackTab | KeyCode::Up => state.prev_field(),
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::Destination => {
+            state.cloud = !state.cloud && shared.rclone_available;
         }
-    }
-
-    pub fn authentication_label(&self) -> String {
-        self.config.browser.map_or_else(
-            || "auth: public content only".to_string(),
-            |browser| format!("auth: {} browser session", browser.label()),
-        )
-    }
-
-    fn next_setup_field(&mut self) {
-        self.setup.field = match (
-            self.setup.field,
-            self.setup.cloud,
-            self.setup.use_browser_cookies,
-        ) {
-            (SetupField::Destination, false, _) => SetupField::LocalPath,
-            (SetupField::Destination, true, _) => SetupField::Remote,
-            (SetupField::LocalPath, _, _) => SetupField::BrowserAuthentication,
-            (SetupField::Remote, _, _) => SetupField::RemotePath,
-            (SetupField::RemotePath, _, _) => SetupField::BrowserAuthentication,
-            (SetupField::BrowserAuthentication, _, true) => SetupField::Browser,
-            (SetupField::BrowserAuthentication, _, false) => SetupField::Destination,
-            (SetupField::Browser, _, _) => SetupField::Destination,
-        };
-    }
-
-    fn prev_setup_field(&mut self) {
-        self.setup.field = match (
-            self.setup.field,
-            self.setup.cloud,
-            self.setup.use_browser_cookies,
-        ) {
-            (SetupField::Destination, _, true) => SetupField::Browser,
-            (SetupField::Destination, false, false) => SetupField::BrowserAuthentication,
-            (SetupField::Destination, true, false) => SetupField::BrowserAuthentication,
-            (SetupField::LocalPath, _, _) => SetupField::Destination,
-            (SetupField::Remote, _, _) => SetupField::Destination,
-            (SetupField::RemotePath, _, _) => SetupField::Remote,
-            (SetupField::BrowserAuthentication, false, _) => SetupField::LocalPath,
-            (SetupField::BrowserAuthentication, true, _) => SetupField::RemotePath,
-            (SetupField::Browser, _, _) => SetupField::BrowserAuthentication,
-        };
-    }
-
-    fn push_setup_char(&mut self, ch: char) {
-        match self.setup.field {
-            SetupField::LocalPath => self.setup.local_path.push(ch),
-            SetupField::Remote => self.setup.remote.push(ch),
-            SetupField::RemotePath => self.setup.remote_path.push(ch),
-            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::BrowserAuthentication => {
+            state.use_browser_cookies = !state.use_browser_cookies;
         }
-    }
-
-    fn backspace_setup_field(&mut self) {
-        match self.setup.field {
-            SetupField::LocalPath => {
-                self.setup.local_path.pop();
-            }
-            SetupField::Remote => {
-                self.setup.remote.pop();
-            }
-            SetupField::RemotePath => {
-                self.setup.remote_path.pop();
-            }
-            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
+        KeyCode::Left if state.field == SetupField::Browser => {
+            state.browser_index =
+                (state.browser_index + Browser::ALL.len() - 1) % Browser::ALL.len();
         }
+        KeyCode::Right if state.field == SetupField::Browser => {
+            state.browser_index = (state.browser_index + 1) % Browser::ALL.len();
+        }
+        KeyCode::Enter => {
+            if let Err(error) = save_setup(state, shared) {
+                return Transition::ShowError(error.to_string());
+            }
+            return Transition::ReturnToMain { clear_input: false };
+        }
+        KeyCode::Backspace => state.backspace_field(),
+        KeyCode::Char(ch) => state.push_char(ch),
+        _ => {}
+    }
+    Transition::Stay
+}
+
+fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Esc => Transition::Quit,
+        KeyCode::Char('q') if state.url_input.is_empty() => Transition::Quit,
+        KeyCode::Enter => {
+            let input = state.url_input.trim().to_string();
+            if input == "/quit" {
+                return Transition::Quit;
+            }
+            if input == "/settings" {
+                state.url_input.clear();
+                return Transition::Push(Screen::Setup(SetupState::from_config(
+                    &shared.config,
+                    shared.rclone_available,
+                )));
+            }
+            if input == "/howtouse" {
+                state.url_input.clear();
+                return Transition::Push(Screen::HowToUse);
+            }
+            match detect_platform(&input) {
+                Ok(_) => Transition::Push(Screen::Format(FormatState {
+                    url: input,
+                    selected: 0,
+                })),
+                Err(error) => Transition::ShowError(error.to_string()),
+            }
+        }
+        KeyCode::Backspace => {
+            state.url_input.pop();
+            Transition::Stay
+        }
+        KeyCode::Char(ch) => {
+            state.url_input.push(ch);
+            Transition::Stay
+        }
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_how_to_use_key(key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => Transition::Back,
+        KeyCode::Char('q') => Transition::Quit,
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_format_key(state: &mut FormatState, shared: &SharedState, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Esc => return Transition::Back,
+        KeyCode::Up | KeyCode::Left => move_selection(&mut state.selected, 2, false),
+        KeyCode::Down | KeyCode::Right => move_selection(&mut state.selected, 2, true),
+        KeyCode::Enter => {
+            return Transition::Push(Screen::Quality(QualityState {
+                url: state.url.clone(),
+                format: if state.selected == 0 {
+                    Format::Video
+                } else {
+                    Format::Audio
+                },
+                selected: quality_index(shared.config.default_quality),
+            }));
+        }
+        _ => {}
+    }
+    Transition::Stay
+}
+
+fn handle_quality_key(
+    state: &mut QualityState,
+    shared: &mut SharedState,
+    key: KeyEvent,
+) -> Transition {
+    match key.code {
+        KeyCode::Esc => return Transition::Back,
+        KeyCode::Up | KeyCode::Left => move_selection(&mut state.selected, 2, false),
+        KeyCode::Down | KeyCode::Right => move_selection(&mut state.selected, 2, true),
+        KeyCode::Enter => {
+            shared.start_download(DownloadRequest {
+                url: state.url.clone(),
+                format: state.format,
+                quality: if state.selected == 0 {
+                    Quality::Best
+                } else {
+                    Quality::Compressed
+                },
+            });
+            return Transition::Replace(Screen::Download(DownloadViewState));
+        }
+        _ => {}
+    }
+    Transition::Stay
+}
+
+fn handle_download_key(shared: &mut SharedState, key: KeyEvent) -> Transition {
+    if key.code == KeyCode::Esc {
+        shared.cancel_active_download();
+    }
+    Transition::Stay
+}
+
+fn handle_complete_key(key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Enter => Transition::ReturnToMain { clear_input: true },
+        KeyCode::Char('q') | KeyCode::Esc => Transition::Quit,
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_error_key(key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => Transition::Back,
+        KeyCode::Char('q') => Transition::Quit,
+        _ => Transition::Stay,
+    }
+}
+
+fn move_selection(selection: &mut usize, count: usize, forward: bool) {
+    if forward {
+        *selection = (*selection + 1) % count;
+    } else {
+        *selection = (*selection + count - 1) % count;
     }
 }
 
@@ -466,6 +498,25 @@ fn quality_index(quality: Quality) -> usize {
         Quality::Best => 0,
         Quality::Compressed => 1,
     }
+}
+
+fn save_setup(state: &SetupState, shared: &mut SharedState) -> Result<()> {
+    shared.config.destination = if state.cloud {
+        Destination::Cloud {
+            remote: state.remote.trim().to_string(),
+            path: state.remote_path.trim().trim_matches('/').to_string(),
+        }
+    } else {
+        Destination::Local {
+            path: state.local_path.trim().into(),
+        }
+    };
+    shared.config.browser = state
+        .use_browser_cookies
+        .then(|| Browser::ALL[state.browser_index]);
+    shared.config.save()?;
+    shared.first_run = false;
+    Ok(())
 }
 
 impl SetupState {
@@ -483,7 +534,6 @@ impl SetupState {
                 remote_path: "dloor".to_string(),
                 use_browser_cookies: config.browser.is_some(),
                 browser_index,
-                rclone_available,
             },
             Destination::Cloud { remote, path } => Self {
                 cloud: rclone_available,
@@ -493,8 +543,57 @@ impl SetupState {
                 remote_path: path.clone(),
                 use_browser_cookies: config.browser.is_some(),
                 browser_index,
-                rclone_available,
             },
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.field = match (self.field, self.cloud, self.use_browser_cookies) {
+            (SetupField::Destination, false, _) => SetupField::LocalPath,
+            (SetupField::Destination, true, _) => SetupField::Remote,
+            (SetupField::LocalPath, _, _) => SetupField::BrowserAuthentication,
+            (SetupField::Remote, _, _) => SetupField::RemotePath,
+            (SetupField::RemotePath, _, _) => SetupField::BrowserAuthentication,
+            (SetupField::BrowserAuthentication, _, true) => SetupField::Browser,
+            (SetupField::BrowserAuthentication, _, false) => SetupField::Destination,
+            (SetupField::Browser, _, _) => SetupField::Destination,
+        };
+    }
+
+    fn prev_field(&mut self) {
+        self.field = match (self.field, self.cloud, self.use_browser_cookies) {
+            (SetupField::Destination, _, true) => SetupField::Browser,
+            (SetupField::Destination, _, false) => SetupField::BrowserAuthentication,
+            (SetupField::LocalPath, _, _) => SetupField::Destination,
+            (SetupField::Remote, _, _) => SetupField::Destination,
+            (SetupField::RemotePath, _, _) => SetupField::Remote,
+            (SetupField::BrowserAuthentication, false, _) => SetupField::LocalPath,
+            (SetupField::BrowserAuthentication, true, _) => SetupField::RemotePath,
+            (SetupField::Browser, _, _) => SetupField::BrowserAuthentication,
+        };
+    }
+
+    fn push_char(&mut self, ch: char) {
+        match self.field {
+            SetupField::LocalPath => self.local_path.push(ch),
+            SetupField::Remote => self.remote.push(ch),
+            SetupField::RemotePath => self.remote_path.push(ch),
+            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
+        }
+    }
+
+    fn backspace_field(&mut self) {
+        match self.field {
+            SetupField::LocalPath => {
+                self.local_path.pop();
+            }
+            SetupField::Remote => {
+                self.remote.pop();
+            }
+            SetupField::RemotePath => {
+                self.remote_path.pop();
+            }
+            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
         }
     }
 }
@@ -502,6 +601,101 @@ impl SetupState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn format_screen() -> Screen {
+        Screen::Format(FormatState {
+            url: "https://youtube.com/watch?v=example".to_string(),
+            selected: 0,
+        })
+    }
+
+    fn quality_screen() -> Screen {
+        Screen::Quality(QualityState {
+            url: "https://youtube.com/watch?v=example".to_string(),
+            format: Format::Video,
+            selected: 0,
+        })
+    }
+
+    fn shared_state(first_run: bool) -> SharedState {
+        SharedState {
+            config: Config::default(),
+            first_run,
+            rclone_available: false,
+            spinner_index: 0,
+            active_download: None,
+            startup_error: None,
+        }
+    }
+
+    #[test]
+    fn navigation_stack_restores_format_then_main() {
+        let mut navigation = Navigation::new(Screen::Main(MainState::default()));
+        navigation.push(format_screen());
+        navigation.push(quality_screen());
+
+        assert!(navigation.back());
+        assert!(matches!(navigation.current, Screen::Format(_)));
+        assert!(navigation.back());
+        assert!(matches!(navigation.current, Screen::Main(_)));
+    }
+
+    #[test]
+    fn empty_navigation_stack_cannot_go_back() {
+        let mut navigation = Navigation::new(Screen::Main(MainState::default()));
+
+        assert!(!navigation.back());
+        assert!(matches!(navigation.current, Screen::Main(_)));
+    }
+
+    #[test]
+    fn return_to_main_preserves_or_clears_the_root_input() {
+        let mut navigation = Navigation::new(Screen::Main(MainState {
+            url_input: "https://example.com".to_string(),
+        }));
+        navigation.push(format_screen());
+        navigation.return_to_main(false);
+        assert!(matches!(
+            &navigation.current,
+            Screen::Main(MainState { url_input }) if url_input == "https://example.com"
+        ));
+
+        navigation.push(format_screen());
+        navigation.return_to_main(true);
+        assert!(matches!(
+            &navigation.current,
+            Screen::Main(MainState { url_input }) if url_input.is_empty()
+        ));
+    }
+
+    #[test]
+    fn errors_always_return_to_main() {
+        let mut navigation = Navigation::new(Screen::Main(MainState::default()));
+        navigation.push(format_screen());
+        navigation.show_error("failed".to_string());
+
+        assert!(matches!(navigation.current, Screen::Error(_)));
+        assert!(navigation.back());
+        assert!(matches!(navigation.current, Screen::Main(_)));
+    }
+
+    #[test]
+    fn escape_stays_on_first_run_setup_but_goes_back_from_settings() {
+        let mut first_run = shared_state(true);
+        let mut first_run_setup = SetupState::from_config(&first_run.config, false);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_setup_key(&mut first_run_setup, &mut first_run, escape),
+            Transition::Stay
+        ));
+
+        let mut configured = shared_state(false);
+        let mut settings = SetupState::from_config(&configured.config, false);
+        assert!(matches!(
+            handle_setup_key(&mut settings, &mut configured, escape),
+            Transition::Back
+        ));
+    }
 
     #[test]
     fn configured_quality_maps_to_the_initial_quality_selection() {

@@ -6,7 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Screen, SetupField};
+use crate::app::{
+    ActiveDownload, App, CompleteState, ErrorState, MainState, Screen, SetupField, SetupState,
+    SharedState,
+};
 
 const LOGO: &str = r"
 ██████╗░██╗░░░░░░█████╗░░█████╗░██████╗░
@@ -18,23 +21,34 @@ const LOGO: &str = r"
 ";
 
 pub fn render(frame: &mut Frame<'_>, app: &App) {
-    match app.screen {
-        Screen::Setup => render_setup(frame, app),
-        Screen::Main => render_main(frame, app),
+    match &app.navigation.current {
+        Screen::Setup(state) => render_setup(
+            frame,
+            state,
+            app.shared.first_run,
+            app.shared.rclone_available,
+        ),
+        Screen::Main(state) => render_main(frame, state, &app.shared),
         Screen::HowToUse => render_how_to_use(frame),
-        Screen::Format => render_choice(frame, "Format", &["Video", "Audio"], app.selected_format),
-        Screen::Quality => render_choice(
+        Screen::Format(state) => {
+            render_choice(frame, "Format", &["Video", "Audio"], state.selected)
+        }
+        Screen::Quality(state) => render_choice(
             frame,
             "Quality",
             &[
                 "Best - possible highest quality",
                 "Compressed - share-friendly size",
             ],
-            app.selected_quality,
+            state.selected,
         ),
-        Screen::Download => render_download(frame, app),
-        Screen::Complete => render_complete(frame, app),
-        Screen::Error => render_error(frame, app),
+        Screen::Download(_) => render_download(
+            frame,
+            app.shared.active_download.as_ref(),
+            app.shared.spinner_index,
+        ),
+        Screen::Complete(state) => render_complete(frame, state),
+        Screen::Error(state) => render_error(frame, state),
     }
 }
 
@@ -66,13 +80,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, text: &str) {
     );
 }
 
-fn render_setup(frame: &mut Frame<'_>, app: &App) {
+fn render_setup(
+    frame: &mut Frame<'_>,
+    state: &SetupState,
+    first_run: bool,
+    rclone_available: bool,
+) {
     let chunks = base_layout(frame.area());
     render_logo(frame, chunks[0]);
 
-    let title = if app.first_run { "Setup" } else { "Settings" };
-    let destination = if app.setup.cloud { "Cloud" } else { "Local" };
-    let cloud_hint = if app.setup.rclone_available {
+    let title = if first_run { "Setup" } else { "Settings" };
+    let destination = if state.cloud { "Cloud" } else { "Local" };
+    let cloud_hint = if rclone_available {
         "Left/Right toggles Local/Cloud"
     } else {
         "rclone not found; cloud upload is disabled until rclone is installed"
@@ -82,46 +101,46 @@ fn render_setup(frame: &mut Frame<'_>, app: &App) {
         field_line(
             "Destination",
             destination,
-            app.setup.field == SetupField::Destination,
+            state.field == SetupField::Destination,
         ),
         Line::from(Span::styled(cloud_hint, Style::new().fg(Color::DarkGray))),
         Line::from(""),
     ];
 
-    if app.setup.cloud {
+    if state.cloud {
         lines.push(field_line(
             "Remote",
-            &app.setup.remote,
-            app.setup.field == SetupField::Remote,
+            &state.remote,
+            state.field == SetupField::Remote,
         ));
         lines.push(field_line(
             "Remote path",
-            &app.setup.remote_path,
-            app.setup.field == SetupField::RemotePath,
+            &state.remote_path,
+            state.field == SetupField::RemotePath,
         ));
     } else {
         lines.push(field_line(
             "Local path",
-            &app.setup.local_path,
-            app.setup.field == SetupField::LocalPath,
+            &state.local_path,
+            state.field == SetupField::LocalPath,
         ));
     }
 
     lines.push(Line::from(""));
     lines.push(field_line(
         "Browser authentication",
-        if app.setup.use_browser_cookies {
+        if state.use_browser_cookies {
             "On"
         } else {
             "Off"
         },
-        app.setup.field == SetupField::BrowserAuthentication,
+        state.field == SetupField::BrowserAuthentication,
     ));
-    if app.setup.use_browser_cookies {
+    if state.use_browser_cookies {
         lines.push(field_line(
             "Browser",
-            dloor_core::Browser::ALL[app.setup.browser_index].label(),
-            app.setup.field == SetupField::Browser,
+            dloor_core::Browser::ALL[state.browser_index].label(),
+            state.field == SetupField::Browser,
         ));
         lines.push(Line::from(Span::styled(
             "Uses the selected browser's logged-in session; cookies are not copied by dloor",
@@ -150,7 +169,7 @@ fn field_line(label: &str, value: &str, selected: bool) -> Line<'static> {
     ])
 }
 
-fn render_main(frame: &mut Frame<'_>, app: &App) {
+fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
     let area = centered(frame.area(), 86, 21);
     let body = Layout::default()
         .direction(Direction::Vertical)
@@ -187,19 +206,19 @@ fn render_main(frame: &mut Frame<'_>, app: &App) {
         body[3],
     );
     frame.render_widget(
-        Paragraph::new(app.destination_label())
+        Paragraph::new(destination_label(shared))
             .alignment(Alignment::Center)
             .fg(Color::Yellow),
         body[5],
     );
     frame.render_widget(
-        Paragraph::new(app.authentication_label())
+        Paragraph::new(authentication_label(shared))
             .alignment(Alignment::Center)
             .fg(Color::DarkGray),
         body[6],
     );
     frame.render_widget(
-        Paragraph::new(app.url_input.as_str())
+        Paragraph::new(state.url_input.as_str())
             .block(Block::default().title("Input URL").borders(Borders::ALL)),
         body[7],
     );
@@ -255,7 +274,7 @@ fn render_choice(frame: &mut Frame<'_>, title: &str, options: &[&str], selected:
     );
 }
 
-fn render_download(frame: &mut Frame<'_>, app: &App) {
+fn render_download(frame: &mut Frame<'_>, active: Option<&ActiveDownload>, spinner_index: usize) {
     let chunks = base_layout(frame.area());
     render_logo(frame, chunks[0]);
     let area = centered(chunks[1], 84, 12);
@@ -268,19 +287,19 @@ fn render_download(frame: &mut Frame<'_>, app: &App) {
         ])
         .split(area);
 
-    let platform = app
-        .selected_platform
+    let platform = active
+        .and_then(|download| download.platform)
         .map(|platform| platform.label())
         .unwrap_or("Detecting...");
+    let status_text = active.map_or("Finishing...", |download| download.status_text.as_str());
     frame.render_widget(
-        Paragraph::new(format!("{platform} | {}", app.status_text))
+        Paragraph::new(format!("{platform} | {status_text}"))
             .block(Block::default().title("Download").borders(Borders::ALL)),
         body[0],
     );
 
-    let percent = app
-        .progress
-        .as_ref()
+    let percent = active
+        .and_then(|download| download.progress.as_ref())
         .map_or(0.0, |progress| progress.percent);
     frame.render_widget(
         Gauge::default()
@@ -290,28 +309,30 @@ fn render_download(frame: &mut Frame<'_>, app: &App) {
         body[1],
     );
 
-    let spinner = ["|", "/", "-", "\\"][app.spinner_index % 4];
-    let detail = app.progress.as_ref().map_or_else(
-        || format!("{spinner} {}", app.status_text),
-        |progress| {
-            format!(
-                "{:.1}%  Speed: {}  ETA: {}",
-                progress.percent, progress.speed, progress.eta
-            )
-        },
-    );
+    let spinner = ["|", "/", "-", "\\"][spinner_index % 4];
+    let detail = active
+        .and_then(|download| download.progress.as_ref())
+        .map_or_else(
+            || format!("{spinner} {status_text}"),
+            |progress| {
+                format!(
+                    "{:.1}%  Speed: {}  ETA: {}",
+                    progress.percent, progress.speed, progress.eta
+                )
+            },
+        );
     frame.render_widget(Paragraph::new(detail).alignment(Alignment::Center), body[2]);
     render_footer(frame, chunks[2], "Esc: cancel download");
 }
 
-fn render_complete(frame: &mut Frame<'_>, app: &App) {
+fn render_complete(frame: &mut Frame<'_>, state: &CompleteState) {
     let chunks = base_layout(frame.area());
     render_logo(frame, chunks[0]);
     frame.render_widget(
         Paragraph::new(vec![
             Line::from("Completed").centered().green().bold(),
             Line::from(""),
-            Line::from(app.completed_path.clone()).centered(),
+            Line::from(state.path.clone()).centered(),
         ])
         .block(Block::default().title("Done").borders(Borders::ALL))
         .wrap(Wrap { trim: false }),
@@ -320,16 +341,34 @@ fn render_complete(frame: &mut Frame<'_>, app: &App) {
     render_footer(frame, chunks[2], "Enter: new download  q: quit");
 }
 
-fn render_error(frame: &mut Frame<'_>, app: &App) {
+fn render_error(frame: &mut Frame<'_>, state: &ErrorState) {
     let area = centered(frame.area(), 76, 10);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(app.error_message.as_str())
+        Paragraph::new(state.message.as_str())
             .block(Block::default().title("Error").borders(Borders::ALL))
             .fg(Color::Red)
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn destination_label(shared: &SharedState) -> String {
+    match &shared.config.destination {
+        dloor_core::Destination::Local { path } => {
+            format!("local: {}", path.to_string_lossy())
+        }
+        dloor_core::Destination::Cloud { remote, .. } => {
+            format!("cloud: Google Drive ({remote})")
+        }
+    }
+}
+
+fn authentication_label(shared: &SharedState) -> String {
+    shared.config.browser.map_or_else(
+        || "auth: public content only".to_string(),
+        |browser| format!("auth: {} browser session", browser.label()),
+    )
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

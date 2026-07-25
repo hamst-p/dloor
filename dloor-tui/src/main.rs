@@ -145,10 +145,6 @@ async fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut Ap
         app.tick();
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        if app.should_quit {
-            return Ok(());
-        }
-
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(key) if app.handle_key(key) == AppAction::Quit => return Ok(()),
