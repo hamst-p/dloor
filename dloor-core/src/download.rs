@@ -104,15 +104,7 @@ impl DownloadJob {
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {
             if let Err(error) = self.run_with_sender(&tx).await {
-                let event = if matches!(error, Error::Cancelled) {
-                    debug!("download job cancelled");
-                    DownloadEvent::Cancelled
-                } else {
-                    error!(%error, "download job failed");
-                    DownloadEvent::Failed {
-                        error: error.to_string(),
-                    }
-                };
+                let event = terminal_event_for_error(error);
                 let _ = tx.send(event).await;
             }
         });
@@ -125,6 +117,7 @@ impl DownloadJob {
         let output_template = work_dir.join("%(title)s [%(id)s].%(ext)s");
 
         let downloaded = self.run_ytdlp(&output_template, platform, tx).await?;
+        self.ensure_not_cancelled()?;
 
         let final_local = if self.request.format == Format::Video
             && self.request.quality == Quality::Compressed
@@ -134,6 +127,7 @@ impl DownloadJob {
         } else {
             downloaded
         };
+        self.ensure_not_cancelled()?;
 
         let completed_path = match &self.config.destination {
             Destination::Local { path } => {
@@ -152,6 +146,7 @@ impl DownloadJob {
                 format!("{}:{}/{}", remote, path.trim_matches('/'), file_name)
             }
         };
+        self.ensure_not_cancelled()?;
 
         tx.send(DownloadEvent::Completed {
             path: completed_path,
@@ -160,6 +155,14 @@ impl DownloadJob {
         .ok();
 
         Ok(())
+    }
+
+    fn ensure_not_cancelled(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() {
+            Err(Error::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 
     async fn prepare_work_dir(&self) -> Result<(PathBuf, TempDir)> {
@@ -259,6 +262,18 @@ impl DownloadJob {
             return Err(Error::MissingOutputFile);
         }
         Ok(output_path)
+    }
+}
+
+fn terminal_event_for_error(error: Error) -> DownloadEvent {
+    if matches!(error, Error::Cancelled) {
+        debug!("download job cancelled");
+        DownloadEvent::Cancelled
+    } else {
+        error!(error = %error, "download job failed");
+        DownloadEvent::Failed {
+            error: error.to_string(),
+        }
     }
 }
 
@@ -830,5 +845,54 @@ mod tests {
         let result = wait_for_process(&mut child, &cancellation).await;
 
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    #[test]
+    fn cancellation_maps_to_cancelled_terminal_event() {
+        assert!(matches!(
+            terminal_event_for_error(Error::Cancelled),
+            DownloadEvent::Cancelled
+        ));
+        assert!(matches!(
+            terminal_event_for_error(Error::ProcessFailed("boom".to_string())),
+            DownloadEvent::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn cancelled_job_does_not_advance_to_the_next_stage() {
+        let job = DownloadJob::new(
+            DownloadRequest {
+                url: "https://example.com/video".to_string(),
+                format: Format::Video,
+                quality: Quality::Best,
+            },
+            Config::default(),
+        );
+        job.cancellation_token().cancel();
+
+        assert!(matches!(job.ensure_not_cancelled(), Err(Error::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn temporary_partial_files_are_removed_with_the_work_directory() {
+        let job = DownloadJob::new(
+            DownloadRequest {
+                url: "https://example.com/video".to_string(),
+                format: Format::Video,
+                quality: Quality::Best,
+            },
+            Config::default(),
+        );
+        let partial_path = {
+            let (work_dir, guard) = job.prepare_work_dir().await.unwrap();
+            let partial_path = work_dir.join("video.mp4.part");
+            fs::write(&partial_path, b"partial").await.unwrap();
+            assert!(partial_path.exists());
+            drop(guard);
+            partial_path
+        };
+
+        assert!(!partial_path.exists());
     }
 }
