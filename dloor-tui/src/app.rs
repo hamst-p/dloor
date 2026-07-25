@@ -498,3 +498,14 @@ impl SetupState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_quality_maps_to_the_initial_quality_selection() {
+        assert_eq!(quality_index(Quality::Best), 0);
+        assert_eq!(quality_index(Quality::Compressed), 1);
+    }
+}
