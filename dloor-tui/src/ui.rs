@@ -8,7 +8,8 @@ use ratatui::{
 
 use crate::app::{
     ActiveDownload, App, CompleteState, ErrorState, GenericConfirmState, HistoryState, MainState,
-    PreviewLoadingState, PreviewState, QueueState, Screen, SetupField, SetupState, SharedState,
+    PreviewLoadingState, PreviewState, QualityState, QueueState, Screen, SetupField, SetupState,
+    SharedState,
 };
 
 const LOGO: &str = r"
@@ -44,15 +45,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::Format(state) => {
             render_choice(frame, "Format", &["Video", "Audio"], state.selected)
         }
-        Screen::Quality(state) => render_choice(
-            frame,
-            "Quality",
-            &[
-                "Best - possible highest quality",
-                "Compressed - share-friendly size",
-            ],
-            state.selected,
-        ),
+        Screen::Quality(state) => render_quality(frame, state),
         Screen::Download(state) => render_download(
             frame,
             app.shared.active_for(state.job_id),
@@ -182,6 +175,15 @@ fn render_setup(
             "Do not ask"
         },
         state.field == SetupField::GenericConfirmation,
+    ));
+    lines.push(field_line(
+        "Bandwidth limit",
+        if state.bandwidth_limit.is_empty() {
+            "Unlimited"
+        } else {
+            &state.bandwidth_limit
+        },
+        state.field == SetupField::BandwidthLimit,
     ));
     lines.push(Line::from(""));
     lines.push(Line::from("Optional media").bold());
@@ -476,6 +478,64 @@ fn render_choice(frame: &mut Frame<'_>, title: &str, options: &[&str], selected:
         frame,
         chunks[2],
         "Arrow keys: select  Enter: continue  Esc: back",
+    );
+}
+
+fn render_quality(frame: &mut Frame<'_>, state: &QualityState) {
+    const VISIBLE_OPTIONS: usize = 6;
+    let chunks = base_layout(frame.area());
+    render_logo(frame, chunks[0]);
+    let items = state
+        .options
+        .iter()
+        .enumerate()
+        .skip(state.scroll_offset)
+        .take(VISIBLE_OPTIONS)
+        .map(|(index, quality)| {
+            let description = match quality {
+                dloor_core::Quality::Best => "possible highest quality".to_string(),
+                dloor_core::Quality::Compressed => "share-friendly size".to_string(),
+                _ => format!("highest available stream at or below {}", quality.label()),
+            };
+            let prefix = if index == state.selected { "> " } else { "  " };
+            let style = if index == state.selected {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            ListItem::new(format!("{prefix}{} - {description}", quality.label())).style(style)
+        })
+        .collect::<Vec<_>>();
+    let mut title = "Quality".to_string();
+    if state.options.len() > VISIBLE_OPTIONS {
+        title.push_str(&format!(
+            " ({}-{}/{})",
+            state.scroll_offset + 1,
+            (state.scroll_offset + VISIBLE_OPTIONS).min(state.options.len()),
+            state.options.len()
+        ));
+    }
+    let area = centered(chunks[1], 80, 12);
+    let body = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(2)])
+        .split(area);
+    frame.render_widget(
+        List::new(items).block(Block::default().title(title).borders(Borders::ALL)),
+        body[0],
+    );
+    if let Some(note) = &state.note {
+        frame.render_widget(
+            Paragraph::new(note.as_str())
+                .alignment(Alignment::Center)
+                .fg(Color::Yellow),
+            body[1],
+        );
+    }
+    render_footer(
+        frame,
+        chunks[2],
+        "Arrow keys: select  Enter: enqueue  Esc: back",
     );
 }
 

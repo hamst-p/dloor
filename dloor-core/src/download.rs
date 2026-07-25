@@ -15,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::{
-    config::{sanitized_ytdlp_error, Config, CookieSource, Destination, MediaOptions},
+    config::{
+        sanitized_ytdlp_error, BandwidthLimit, Config, CookieSource, Destination, MediaOptions,
+    },
     detect_platform, Error, MetadataPreview, Platform, Result,
 };
 
@@ -38,13 +40,47 @@ impl Format {
 pub enum Quality {
     Best,
     Compressed,
+    #[serde(rename = "720p")]
+    P720,
+    #[serde(rename = "1080p")]
+    P1080,
+    #[serde(rename = "1440p")]
+    P1440,
+    #[serde(rename = "2160p")]
+    P2160,
 }
 
 impl Quality {
+    pub const RESOLUTIONS: [Self; 4] = [Self::P720, Self::P1080, Self::P1440, Self::P2160];
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Best => "Best",
             Self::Compressed => "Compressed",
+            Self::P720 => "720p",
+            Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2160 => "2160p",
+        }
+    }
+
+    pub fn height(self) -> Option<u32> {
+        match self {
+            Self::Best | Self::Compressed => None,
+            Self::P720 => Some(720),
+            Self::P1080 => Some(1080),
+            Self::P1440 => Some(1440),
+            Self::P2160 => Some(2160),
+        }
+    }
+
+    pub fn from_height(height: u64) -> Option<Self> {
+        match height {
+            720 => Some(Self::P720),
+            1080 => Some(Self::P1080),
+            1440 => Some(Self::P1440),
+            2160 => Some(Self::P2160),
+            _ => None,
         }
     }
 }
@@ -100,6 +136,7 @@ pub enum DownloadWarningKind {
     ChapterEmbedding,
     SubtitleSidecar,
     OptionalPostProcessing,
+    ResolutionFallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +446,7 @@ impl DownloadJob {
     ) -> Result<YtdlpOutput> {
         let mut args = base_ytdlp_args(output_template, &self.config.cookies);
         args.extend(format_args(self.request.format, self.request.quality));
+        args.extend(bandwidth_args(self.config.bandwidth_limit.as_ref()));
         let (optional_args, mut warnings) = media_args(
             &self.config.media,
             self.request.format,
@@ -448,6 +486,7 @@ impl DownloadJob {
         let mut stdout_lines = BufReader::new(stdout).lines();
         let mut stderr_lines = BufReader::new(stderr).lines();
         let mut output_path = None;
+        let mut selected_height = None;
         let mut stderr_messages = Vec::new();
         let expected_parts = usize::from(self.request.format == Format::Video) + 1;
         let mut progress_tracker = ProgressTracker::new(expected_parts);
@@ -464,6 +503,8 @@ impl DownloadJob {
                         Some(line) => {
                             if let Some(path) = parse_output_line(&line) {
                                 output_path = Some(path);
+                            } else if let Some(height) = parse_height_line(&line) {
+                                selected_height = Some(height);
                             } else {
                                 // before_dl planning records share stdout with the
                                 // after_move record, but are unambiguously prefixed.
@@ -509,6 +550,17 @@ impl DownloadJob {
         };
         let stderr = stderr_messages.join("\n");
         warnings.extend(postprocessing_warnings(&stderr, &self.config.media, &item));
+        if let (Some(requested), Some(actual)) = (self.request.quality.height(), selected_height) {
+            if actual != u64::from(requested) {
+                warnings.push(DownloadWarning {
+                    item: item.clone(),
+                    kind: DownloadWarningKind::ResolutionFallback,
+                    message: format!(
+                        "Requested {requested}p was unavailable; yt-dlp selected {actual}p."
+                    ),
+                });
+            }
+        }
         deduplicate_warnings(&mut warnings);
         let output_path = output_path.ok_or(Error::MissingOutputFile)?;
         let output_is_valid = output_path.extension().is_none_or(|ext| ext != "part")
@@ -744,6 +796,7 @@ fn error_kind(error: &Error) -> &'static str {
 }
 
 const OUTPUT_PREFIX: &str = "DLOOR_OUTPUT|";
+const HEIGHT_PREFIX: &str = "DLOOR_HEIGHT|";
 const PLAN_PREFIX: &str = "DLOOR_PLAN|";
 const PROGRESS_PREFIX: &str = "DLOOR_PROGRESS|";
 
@@ -773,6 +826,8 @@ fn base_ytdlp_args(output_template: &Path, cookies: &CookieSource) -> Vec<OsStri
         .into(),
         "--print".into(),
         "after_move:DLOOR_OUTPUT|%(filepath)s".into(),
+        "--print".into(),
+        "after_move:DLOOR_HEIGHT|%(height)s".into(),
         "-o".into(),
         output_template.as_os_str().to_os_string(),
     ];
@@ -812,7 +867,36 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
             "--audio-quality".into(),
             "5".into(),
         ],
+        (Format::Video, quality) => {
+            let height = quality
+                .height()
+                .expect("remaining video quality variants have a height");
+            vec![
+                "-f".into(),
+                format!("bestvideo*[height<={height}]+bestaudio/best[height<={height}]/best")
+                    .into(),
+                "--merge-output-format".into(),
+                "mp4".into(),
+            ]
+        }
+        (Format::Audio, Quality::P720 | Quality::P1080 | Quality::P1440 | Quality::P2160) => {
+            vec![
+                "-f".into(),
+                "bestaudio".into(),
+                "-x".into(),
+                "--audio-format".into(),
+                "m4a".into(),
+                "--audio-quality".into(),
+                "0".into(),
+            ]
+        }
     }
+}
+
+fn bandwidth_args(limit: Option<&BandwidthLimit>) -> Vec<OsString> {
+    limit.map_or_else(Vec::new, |limit| {
+        vec!["--limit-rate".into(), limit.as_str().into()]
+    })
 }
 
 fn media_args(
@@ -1200,6 +1284,10 @@ fn parse_optional_u64(value: &str) -> Option<u64> {
 
 fn parse_output_line(line: &str) -> Option<PathBuf> {
     line.strip_prefix(OUTPUT_PREFIX).map(PathBuf::from)
+}
+
+fn parse_height_line(line: &str) -> Option<u64> {
+    line.strip_prefix(HEIGHT_PREFIX)?.trim().parse().ok()
 }
 
 pub fn parse_progress_line(line: &str) -> Option<DownloadProgress> {
@@ -1738,6 +1826,33 @@ mod tests {
         assert_eq!(
             collect_subtitle_sidecars(dir.path(), &media).await.unwrap(),
             [subtitle]
+        );
+    }
+
+    #[test]
+    fn resolution_formats_use_a_bounded_selector_with_an_explicit_fallback() {
+        for (quality, height) in [
+            (Quality::P720, 720),
+            (Quality::P1080, 1080),
+            (Quality::P1440, 1440),
+            (Quality::P2160, 2160),
+        ] {
+            let args = format_args(Format::Video, quality);
+            let selector =
+                format!("bestvideo*[height<={height}]+bestaudio/best[height<={height}]/best");
+            assert!(args.contains(&OsString::from(selector)));
+        }
+        assert_eq!(parse_height_line("DLOOR_HEIGHT|1080"), Some(1080));
+        assert_eq!(parse_height_line("DLOOR_HEIGHT|NA"), None);
+    }
+
+    #[test]
+    fn bandwidth_limit_is_applied_only_to_download_arguments() {
+        assert!(bandwidth_args(None).is_empty());
+        let limit = "4.2M".parse::<BandwidthLimit>().unwrap();
+        assert_eq!(
+            bandwidth_args(Some(&limit)),
+            [OsString::from("--limit-rate"), OsString::from("4.2M")]
         );
     }
 }

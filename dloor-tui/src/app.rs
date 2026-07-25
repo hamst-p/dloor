@@ -56,6 +56,7 @@ pub struct FormatState {
     pub title: String,
     pub playlist: PlaylistSelection,
     pub selected: usize,
+    pub available_resolutions: Vec<Quality>,
 }
 
 #[derive(Debug)]
@@ -71,7 +72,10 @@ pub struct QualityState {
     pub title: String,
     pub playlist: PlaylistSelection,
     pub format: Format,
+    pub options: Vec<Quality>,
     pub selected: usize,
+    pub scroll_offset: usize,
+    pub note: Option<String>,
 }
 
 #[derive(Debug)]
@@ -115,6 +119,7 @@ pub enum SetupField {
     Browser,
     CookieFile,
     GenericConfirmation,
+    BandwidthLimit,
     WriteSubtitles,
     EmbedSubtitles,
     SubtitleLanguages,
@@ -134,6 +139,7 @@ pub struct SetupState {
     pub browser_index: usize,
     pub cookie_file_path: String,
     pub confirm_generic_urls: bool,
+    pub bandwidth_limit: String,
     pub write_subtitles: bool,
     pub embed_subtitles: bool,
     pub subtitle_languages: String,
@@ -862,6 +868,7 @@ fn handle_preview_key(state: &PreviewState, key: KeyEvent) -> Transition {
             title: state.preview.title.clone(),
             playlist: PlaylistSelection::Single,
             selected: 0,
+            available_resolutions: metadata_qualities(&state.preview),
         })),
         _ => Transition::Stay,
     }
@@ -882,6 +889,7 @@ fn handle_playlist_key(state: &mut PlaylistState, key: KeyEvent) -> Transition {
                     PlaylistSelection::All
                 },
                 selected: 0,
+                available_resolutions: Quality::RESOLUTIONS.to_vec(),
             }));
         }
         _ => {}
@@ -895,16 +903,34 @@ fn handle_format_key(state: &mut FormatState, shared: &SharedState, key: KeyEven
         KeyCode::Up | KeyCode::Left => move_selection(&mut state.selected, 2, false),
         KeyCode::Down | KeyCode::Right => move_selection(&mut state.selected, 2, true),
         KeyCode::Enter => {
+            let format = if state.selected == 0 {
+                Format::Video
+            } else {
+                Format::Audio
+            };
+            let mut options = vec![Quality::Best, Quality::Compressed];
+            if format == Format::Video {
+                options.extend(state.available_resolutions.iter().copied());
+            }
+            let selected = options
+                .iter()
+                .position(|quality| *quality == shared.config.default_quality)
+                .unwrap_or(0);
+            let note = (!options.contains(&shared.config.default_quality)).then(|| {
+                format!(
+                    "Configured default {} is unavailable here; using Best.",
+                    shared.config.default_quality.label()
+                )
+            });
             return Transition::Push(Screen::Quality(QualityState {
                 url: state.url.clone(),
                 title: state.title.clone(),
                 playlist: state.playlist,
-                format: if state.selected == 0 {
-                    Format::Video
-                } else {
-                    Format::Audio
-                },
-                selected: quality_index(shared.config.default_quality),
+                format,
+                options,
+                selected,
+                scroll_offset: selected.saturating_sub(5),
+                note,
             }));
         }
         _ => {}
@@ -919,17 +945,19 @@ fn handle_quality_key(
 ) -> Transition {
     match key.code {
         KeyCode::Esc => return Transition::Back,
-        KeyCode::Up | KeyCode::Left => move_selection(&mut state.selected, 2, false),
-        KeyCode::Down | KeyCode::Right => move_selection(&mut state.selected, 2, true),
+        KeyCode::Up | KeyCode::Left => {
+            move_selection(&mut state.selected, state.options.len(), false);
+            state.sync_scroll();
+        }
+        KeyCode::Down | KeyCode::Right => {
+            move_selection(&mut state.selected, state.options.len(), true);
+            state.sync_scroll();
+        }
         KeyCode::Enter => {
             let request = DownloadRequest {
                 url: state.url.clone(),
                 format: state.format,
-                quality: if state.selected == 0 {
-                    Quality::Best
-                } else {
-                    Quality::Compressed
-                },
+                quality: state.options[state.selected],
                 playlist: state.playlist,
             };
             shared.enqueue(request, state.title.clone());
@@ -1080,10 +1108,26 @@ fn move_selection(selection: &mut usize, count: usize, forward: bool) {
     }
 }
 
-fn quality_index(quality: Quality) -> usize {
-    match quality {
-        Quality::Best => 0,
-        Quality::Compressed => 1,
+fn metadata_qualities(preview: &MetadataPreview) -> Vec<Quality> {
+    Quality::RESOLUTIONS
+        .into_iter()
+        .filter(|quality| {
+            preview
+                .resolutions
+                .iter()
+                .any(|resolution| resolution == quality.label())
+        })
+        .collect()
+}
+
+impl QualityState {
+    fn sync_scroll(&mut self) {
+        const VISIBLE_OPTIONS: usize = 6;
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + VISIBLE_OPTIONS {
+            self.scroll_offset = self.selected + 1 - VISIBLE_OPTIONS;
+        }
     }
 }
 
@@ -1113,6 +1157,11 @@ fn save_setup(state: &SetupState, shared: &mut SharedState) -> Result<()> {
         _ => unreachable!("cookie source selection is always normalized"),
     };
     shared.config.confirm_generic_urls = state.confirm_generic_urls;
+    shared.config.bandwidth_limit = if state.bandwidth_limit.trim().is_empty() {
+        None
+    } else {
+        Some(state.bandwidth_limit.parse().map_err(anyhow::Error::msg)?)
+    };
     shared.config.media.write_subtitles = state.write_subtitles;
     shared.config.media.embed_subtitles = state.embed_subtitles;
     shared.config.media.subtitle_languages = state
@@ -1163,6 +1212,10 @@ impl SetupState {
                 browser_index,
                 cookie_file_path,
                 confirm_generic_urls: config.confirm_generic_urls,
+                bandwidth_limit: config
+                    .bandwidth_limit
+                    .as_ref()
+                    .map_or_else(String::new, |limit| limit.as_str().to_string()),
                 write_subtitles: config.media.write_subtitles,
                 embed_subtitles: config.media.embed_subtitles,
                 subtitle_languages: config.media.subtitle_languages.join(","),
@@ -1181,6 +1234,10 @@ impl SetupState {
                 browser_index,
                 cookie_file_path,
                 confirm_generic_urls: config.confirm_generic_urls,
+                bandwidth_limit: config
+                    .bandwidth_limit
+                    .as_ref()
+                    .map_or_else(String::new, |limit| limit.as_str().to_string()),
                 write_subtitles: config.media.write_subtitles,
                 embed_subtitles: config.media.embed_subtitles,
                 subtitle_languages: config.media.subtitle_languages.join(","),
@@ -1230,6 +1287,7 @@ impl SetupState {
         }
         fields.extend([
             SetupField::GenericConfirmation,
+            SetupField::BandwidthLimit,
             SetupField::WriteSubtitles,
             SetupField::EmbedSubtitles,
             SetupField::SubtitleLanguages,
@@ -1246,6 +1304,7 @@ impl SetupState {
             SetupField::Remote => self.remote.push(ch),
             SetupField::RemotePath => self.remote_path.push(ch),
             SetupField::CookieFile => self.cookie_file_path.push(ch),
+            SetupField::BandwidthLimit => self.bandwidth_limit.push(ch),
             SetupField::SubtitleLanguages => self.subtitle_languages.push(ch),
             SetupField::Destination
             | SetupField::CookieSource
@@ -1273,6 +1332,9 @@ impl SetupState {
             SetupField::CookieFile => {
                 self.cookie_file_path.pop();
             }
+            SetupField::BandwidthLimit => {
+                self.bandwidth_limit.pop();
+            }
             SetupField::SubtitleLanguages => {
                 self.subtitle_languages.pop();
             }
@@ -1299,6 +1361,7 @@ mod tests {
             title: "Example".to_string(),
             playlist: PlaylistSelection::Single,
             selected: 0,
+            available_resolutions: vec![Quality::P720],
         })
     }
 
@@ -1308,7 +1371,10 @@ mod tests {
             title: "Example".to_string(),
             playlist: PlaylistSelection::Single,
             format: Format::Video,
+            options: vec![Quality::Best, Quality::Compressed, Quality::P720],
             selected: 0,
+            scroll_offset: 0,
+            note: None,
         })
     }
 
@@ -1400,7 +1466,20 @@ mod tests {
 
     #[test]
     fn configured_quality_maps_to_the_initial_quality_selection() {
-        assert_eq!(quality_index(Quality::Best), 0);
-        assert_eq!(quality_index(Quality::Compressed), 1);
+        let options = [Quality::Best, Quality::Compressed, Quality::P1080];
+        assert_eq!(
+            options
+                .iter()
+                .position(|quality| *quality == Quality::P1080),
+            Some(2)
+        );
+        let preview = MetadataPreview {
+            title: "Example".to_string(),
+            uploader: None,
+            duration_seconds: None,
+            resolutions: vec!["1080p".to_string(), "480p".to_string()],
+            playlist: None,
+        };
+        assert_eq!(metadata_qualities(&preview), [Quality::P1080]);
     }
 }

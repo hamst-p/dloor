@@ -46,6 +46,8 @@ dloor is early-stage OSS software. The local download flow is the primary suppor
   and chapter embedding
 - Keep a usable media file when optional embedding fails and report the issue as
   a completion warning
+- Select 720p, 1080p, 1440p, or 2160p video bounds when available
+- Apply an optional validated yt-dlp bandwidth limit
 - Save locally or upload through an optional `rclone` remote
 
 ## Quick Start
@@ -195,7 +197,7 @@ Then enter the remote name and remote path in dloor's setup screen.
    duration, resolutions, and playlist sample.
 5. For a playlist, choose whether to download one item or the entire playlist.
 6. Choose `Video` or `Audio`.
-7. Choose `Best` or `Compressed`.
+7. Choose `Best`, `Compressed`, or an available resolution for video.
 8. The job is added to the queue and the main screen is ready for another URL.
 9. Open `/queue` to monitor current-item and overall progress.
 10. Open `/history` to review saved paths, failures, or retry a failed item.
@@ -227,8 +229,17 @@ the active process and discards waiting jobs before the application exits.
 
 - Video / Best: downloads `bestvideo*+bestaudio/best` and merges to mp4
 - Video / Compressed: downloads up to 1080p, then re-encodes with `ffmpeg` using `libx264 -crf 28 -preset fast`; the pre-transcode source file is removed after a successful conversion
+- Video / 720p, 1080p, 1440p, or 2160p: chooses the highest available
+  video stream at or below the selected height and merges the best audio
 - Audio / Best: extracts m4a at best available quality
 - Audio / Compressed: extracts mp3 with `--audio-quality 5`
+
+For a single-video preview, only standard resolution choices actually reported
+by yt-dlp are shown. Playlist previews intentionally inspect only the first five
+flat entries, so all four standard choices are shown; each item is resolved
+independently. If no stream exists at or below the requested height, yt-dlp
+falls back to `best`. Whenever the confirmed output height differs from the
+request, the completion screen reports the selected height as a warning.
 
 ## Configuration
 
@@ -244,6 +255,22 @@ The `default_quality` value controls the initial selection on each Quality scree
 ```toml
 default_quality = "Compressed"
 ```
+
+Existing `"Best"` and `"Compressed"` values remain valid. Resolution defaults
+use `"720p"`, `"1080p"`, `"1440p"`, or `"2160p"`. If a configured resolution is
+not available on the current single-video preview, the Quality screen selects
+Best and explains why.
+
+An optional `bandwidth_limit` accepts positive byte rates such as `"50K"`,
+`"4.2M"`, `"1G"`, or an integer byte count:
+
+```toml
+bandwidth_limit = "4.2M"
+```
+
+Leave the field empty in `/settings` for no limit. The value is passed to
+yt-dlp as `--limit-rate` only for actual downloads, not metadata or playlist
+preview requests.
 
 Metadata previews use the same optional cookie setting as the eventual download.
 Playlist previews are limited to the first five entries;

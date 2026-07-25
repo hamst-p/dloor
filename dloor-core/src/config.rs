@@ -2,6 +2,7 @@ use std::{
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use directories::{ProjectDirs, UserDirs};
@@ -113,12 +114,74 @@ pub struct MediaOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(transparent)]
+pub struct BandwidthLimit(String);
+
+impl BandwidthLimit {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for BandwidthLimit {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.is_empty() || value.chars().any(char::is_whitespace) {
+            return Err(
+                "Bandwidth limit must be a positive byte rate such as 50K or 4.2M".to_string(),
+            );
+        }
+        let (number, suffix) = value
+            .char_indices()
+            .last()
+            .filter(|(_, character)| character.is_ascii_alphabetic())
+            .map_or((value, None), |(index, character)| {
+                (&value[..index], Some(character.to_ascii_uppercase()))
+            });
+        if !matches!(suffix, None | Some('K' | 'M' | 'G'))
+            || number.is_empty()
+            || number.starts_with('.')
+            || number.ends_with('.')
+            || number.chars().filter(|character| *character == '.').count() > 1
+            || !number
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '.')
+            || (suffix.is_none() && number.contains('.'))
+            || number
+                .parse::<f64>()
+                .map_or(true, |parsed| !parsed.is_finite() || parsed <= 0.0)
+        {
+            return Err(
+                "Bandwidth limit must be a positive byte rate such as 50K or 4.2M".to_string(),
+            );
+        }
+        Ok(Self(match suffix {
+            Some(suffix) => format!("{number}{suffix}"),
+            None => number.to_string(),
+        }))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for BandwidthLimit {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Config {
     pub destination: Destination,
     pub default_quality: Quality,
     pub cookies: CookieSource,
     pub confirm_generic_urls: bool,
     pub media: MediaOptions,
+    pub bandwidth_limit: Option<BandwidthLimit>,
 }
 
 #[derive(serde::Deserialize)]
@@ -133,6 +196,8 @@ struct ConfigFile {
     confirm_generic_urls: bool,
     #[serde(default)]
     media: MediaOptions,
+    #[serde(default)]
+    bandwidth_limit: Option<BandwidthLimit>,
 }
 
 impl<'de> serde::Deserialize<'de> for Config {
@@ -152,6 +217,7 @@ impl<'de> serde::Deserialize<'de> for Config {
             }),
             confirm_generic_urls: file.confirm_generic_urls,
             media: file.media,
+            bandwidth_limit: file.bandwidth_limit,
         })
     }
 }
@@ -166,6 +232,7 @@ impl Default for Config {
             cookies: CookieSource::None,
             confirm_generic_urls: default_confirm_generic_urls(),
             media: MediaOptions::default(),
+            bandwidth_limit: None,
         }
     }
 }
@@ -318,6 +385,7 @@ mod tests {
                 embed_thumbnail: true,
                 embed_chapters: true,
             },
+            bandwidth_limit: Some("4.2m".parse().unwrap()),
         };
 
         config.save_to(&path).unwrap();
@@ -340,6 +408,7 @@ path = "/tmp"
         assert_eq!(config.cookies, CookieSource::None);
         assert!(config.confirm_generic_urls);
         assert_eq!(config.media, MediaOptions::default());
+        assert_eq!(config.bandwidth_limit, None);
     }
 
     #[test]
@@ -364,6 +433,7 @@ path = "/tmp"
         );
         assert!(config.confirm_generic_urls);
         assert_eq!(config.media, MediaOptions::default());
+        assert_eq!(config.bandwidth_limit, None);
         let serialized = toml::to_string(&config).unwrap();
         assert!(serialized.contains("[cookies]"));
         assert!(!serialized.contains("browser = \"firefox\"\n\n[destination]"));
@@ -403,5 +473,18 @@ path = "/tmp"
 
         assert!(!message.contains("/private/cookies.txt"));
         assert!(message.contains("<cookie-file>"));
+    }
+
+    #[test]
+    fn bandwidth_limits_are_validated_and_normalized() {
+        assert_eq!("50k".parse::<BandwidthLimit>().unwrap().as_str(), "50K");
+        assert_eq!("4.2M".parse::<BandwidthLimit>().unwrap().as_str(), "4.2M");
+        assert_eq!(
+            "1000000".parse::<BandwidthLimit>().unwrap().as_str(),
+            "1000000"
+        );
+        for invalid in ["", "0", "-1M", "1 MB", ".5M", "1.2", "1T", "unlimited"] {
+            assert!(invalid.parse::<BandwidthLimit>().is_err(), "{invalid}");
+        }
     }
 }
