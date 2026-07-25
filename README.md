@@ -203,7 +203,11 @@ The `default_quality` value controls the initial selection on each Quality scree
 default_quality = "Compressed"
 ```
 
-Runtime diagnostics are appended to `dloor.log` beside `config.toml`. Set `RUST_LOG` when you need a different log level; dloor logs its own crates at `debug` by default.
+Runtime diagnostics are written to `dloor.log` beside `config.toml`. The file is
+limited to 5 MiB and one `dloor.log.1` backup is retained. Set `RUST_LOG` when
+you need a different log level; dloor logs its own crates at `debug` by default.
+Diagnostic logs intentionally omit download URLs, local and cloud paths, browser
+profiles, command arguments, and raw external-tool error output.
 
 You can reopen the setup screen from inside the app with:
 

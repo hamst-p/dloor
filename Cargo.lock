@@ -195,6 +195,7 @@ dependencies = [
  "crossterm",
  "dloor-core",
  "ratatui",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",

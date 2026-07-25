@@ -182,7 +182,12 @@ impl DownloadJob {
         args.extend(format_args(self.request.format, self.request.quality));
         args.push(OsString::from(&self.request.url));
 
-        debug!(?args, "spawning yt-dlp");
+        debug!(
+            format = ?self.request.format,
+            quality = ?self.request.quality,
+            browser_authentication = self.config.browser.is_some(),
+            "spawning yt-dlp"
+        );
         let mut child = Command::new("yt-dlp")
             .args(args)
             .kill_on_drop(true)
@@ -270,10 +275,25 @@ fn terminal_event_for_error(error: Error) -> DownloadEvent {
         debug!("download job cancelled");
         DownloadEvent::Cancelled
     } else {
-        error!(error = %error, "download job failed");
+        error!(kind = error_kind(&error), "download job failed");
         DownloadEvent::Failed {
             error: error.to_string(),
         }
+    }
+}
+
+fn error_kind(error: &Error) -> &'static str {
+    match error {
+        Error::UnsupportedUrl(_) => "unsupported_url",
+        Error::ConfigDirUnavailable => "config_dir_unavailable",
+        Error::Io(_) => "io",
+        Error::TomlDecode(_) => "toml_decode",
+        Error::TomlEncode(_) => "toml_encode",
+        Error::MissingTool(_) => "missing_tool",
+        Error::ProcessFailed(_) => "process_failed",
+        Error::Cancelled => "cancelled",
+        Error::MissingOutputFile => "missing_output_file",
+        Error::InvalidPath(_) => "invalid_path",
     }
 }
 
