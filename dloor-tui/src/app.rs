@@ -2,10 +2,10 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dloor_core::{
     check_dependencies, config::default_download_dir, detect_platform, Browser, Config,
-    Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress, DownloadQueue,
-    DownloadRequest, DownloadSummary, Format, HistoryEntry, HistoryStatus, HistoryStore, JobId,
-    MetadataJob, MetadataPreview, MetadataRequest, Platform, PlaylistSelection, Quality,
-    QueueStatus, DEFAULT_HISTORY_LIMIT,
+    CookieSource, Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress,
+    DownloadQueue, DownloadRequest, DownloadSummary, Format, HistoryEntry, HistoryStatus,
+    HistoryStore, JobId, MetadataJob, MetadataPreview, MetadataRequest, Platform,
+    PlaylistSelection, Quality, QueueStatus, DEFAULT_HISTORY_LIMIT,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -105,8 +105,9 @@ pub enum SetupField {
     LocalPath,
     Remote,
     RemotePath,
-    BrowserAuthentication,
+    CookieSource,
     Browser,
+    CookieFile,
 }
 
 #[derive(Debug)]
@@ -116,8 +117,9 @@ pub struct SetupState {
     pub local_path: String,
     pub remote: String,
     pub remote_path: String,
-    pub use_browser_cookies: bool,
+    pub cookie_source_index: usize,
     pub browser_index: usize,
+    pub cookie_file_path: String,
 }
 
 #[derive(Debug)]
@@ -358,7 +360,7 @@ impl SharedState {
     fn start_preview(&mut self, url: String) {
         let job = MetadataJob::new(MetadataRequest {
             url: url.clone(),
-            browser: self.config.browser,
+            cookies: self.config.cookies.clone(),
         });
         let cancellation = job.cancellation_token();
         self.active_preview = Some(ActivePreview {
@@ -677,8 +679,11 @@ fn handle_setup_key(state: &mut SetupState, shared: &mut SharedState, key: KeyEv
         KeyCode::Left | KeyCode::Right if state.field == SetupField::Destination => {
             state.cloud = !state.cloud && shared.rclone_available;
         }
-        KeyCode::Left | KeyCode::Right if state.field == SetupField::BrowserAuthentication => {
-            state.use_browser_cookies = !state.use_browser_cookies;
+        KeyCode::Left if state.field == SetupField::CookieSource => {
+            state.cookie_source_index = (state.cookie_source_index + 2) % 3;
+        }
+        KeyCode::Right if state.field == SetupField::CookieSource => {
+            state.cookie_source_index = (state.cookie_source_index + 1) % 3;
         }
         KeyCode::Left if state.field == SetupField::Browser => {
             state.browser_index =
@@ -1019,9 +1024,20 @@ fn save_setup(state: &SetupState, shared: &mut SharedState) -> Result<()> {
             path: state.local_path.trim().into(),
         }
     };
-    shared.config.browser = state
-        .use_browser_cookies
-        .then(|| Browser::ALL[state.browser_index]);
+    shared.config.cookies = match state.cookie_source_index {
+        0 => CookieSource::None,
+        1 => CookieSource::Browser {
+            browser: Browser::ALL[state.browser_index],
+        },
+        2 => {
+            let path = state.cookie_file_path.trim();
+            if path.is_empty() {
+                anyhow::bail!("Cookie file path cannot be empty");
+            }
+            CookieSource::File { path: path.into() }
+        }
+        _ => unreachable!("cookie source selection is always normalized"),
+    };
     shared.config.save()?;
     shared.first_run = false;
     Ok(())
@@ -1029,10 +1045,22 @@ fn save_setup(state: &SetupState, shared: &mut SharedState) -> Result<()> {
 
 impl SetupState {
     fn from_config(config: &Config, rclone_available: bool) -> Self {
-        let browser_index = config
-            .browser
-            .and_then(|selected| Browser::ALL.iter().position(|browser| *browser == selected))
-            .unwrap_or(0);
+        let browser_index = match &config.cookies {
+            CookieSource::Browser { browser } => Browser::ALL
+                .iter()
+                .position(|candidate| candidate == browser),
+            CookieSource::None | CookieSource::File { .. } => None,
+        }
+        .unwrap_or(0);
+        let cookie_source_index = match &config.cookies {
+            CookieSource::None => 0,
+            CookieSource::Browser { .. } => 1,
+            CookieSource::File { .. } => 2,
+        };
+        let cookie_file_path = match &config.cookies {
+            CookieSource::File { path } => path.to_string_lossy().to_string(),
+            CookieSource::None | CookieSource::Browser { .. } => String::new(),
+        };
         match &config.destination {
             Destination::Local { path } => Self {
                 cloud: false,
@@ -1040,8 +1068,9 @@ impl SetupState {
                 local_path: path.to_string_lossy().to_string(),
                 remote: "gdrive".to_string(),
                 remote_path: "dloor".to_string(),
-                use_browser_cookies: config.browser.is_some(),
+                cookie_source_index,
                 browser_index,
+                cookie_file_path,
             },
             Destination::Cloud { remote, path } => Self {
                 cloud: rclone_available,
@@ -1049,35 +1078,41 @@ impl SetupState {
                 local_path: default_download_dir().to_string_lossy().to_string(),
                 remote: remote.clone(),
                 remote_path: path.clone(),
-                use_browser_cookies: config.browser.is_some(),
+                cookie_source_index,
                 browser_index,
+                cookie_file_path,
             },
         }
     }
 
     fn next_field(&mut self) {
-        self.field = match (self.field, self.cloud, self.use_browser_cookies) {
+        self.field = match (self.field, self.cloud, self.cookie_source_index) {
             (SetupField::Destination, false, _) => SetupField::LocalPath,
             (SetupField::Destination, true, _) => SetupField::Remote,
-            (SetupField::LocalPath, _, _) => SetupField::BrowserAuthentication,
+            (SetupField::LocalPath, _, _) => SetupField::CookieSource,
             (SetupField::Remote, _, _) => SetupField::RemotePath,
-            (SetupField::RemotePath, _, _) => SetupField::BrowserAuthentication,
-            (SetupField::BrowserAuthentication, _, true) => SetupField::Browser,
-            (SetupField::BrowserAuthentication, _, false) => SetupField::Destination,
+            (SetupField::RemotePath, _, _) => SetupField::CookieSource,
+            (SetupField::CookieSource, _, 1) => SetupField::Browser,
+            (SetupField::CookieSource, _, 2) => SetupField::CookieFile,
+            (SetupField::CookieSource, _, _) => SetupField::Destination,
             (SetupField::Browser, _, _) => SetupField::Destination,
+            (SetupField::CookieFile, _, _) => SetupField::Destination,
         };
     }
 
     fn prev_field(&mut self) {
-        self.field = match (self.field, self.cloud, self.use_browser_cookies) {
-            (SetupField::Destination, _, true) => SetupField::Browser,
-            (SetupField::Destination, _, false) => SetupField::BrowserAuthentication,
+        self.field = match (self.field, self.cloud, self.cookie_source_index) {
+            (SetupField::Destination, _, 1) => SetupField::Browser,
+            (SetupField::Destination, _, 2) => SetupField::CookieFile,
+            (SetupField::Destination, _, _) => SetupField::CookieSource,
             (SetupField::LocalPath, _, _) => SetupField::Destination,
             (SetupField::Remote, _, _) => SetupField::Destination,
             (SetupField::RemotePath, _, _) => SetupField::Remote,
-            (SetupField::BrowserAuthentication, false, _) => SetupField::LocalPath,
-            (SetupField::BrowserAuthentication, true, _) => SetupField::RemotePath,
-            (SetupField::Browser, _, _) => SetupField::BrowserAuthentication,
+            (SetupField::CookieSource, false, _) => SetupField::LocalPath,
+            (SetupField::CookieSource, true, _) => SetupField::RemotePath,
+            (SetupField::Browser, _, _) | (SetupField::CookieFile, _, _) => {
+                SetupField::CookieSource
+            }
         };
     }
 
@@ -1086,7 +1121,8 @@ impl SetupState {
             SetupField::LocalPath => self.local_path.push(ch),
             SetupField::Remote => self.remote.push(ch),
             SetupField::RemotePath => self.remote_path.push(ch),
-            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
+            SetupField::CookieFile => self.cookie_file_path.push(ch),
+            SetupField::Destination | SetupField::CookieSource | SetupField::Browser => {}
         }
     }
 
@@ -1101,7 +1137,10 @@ impl SetupState {
             SetupField::RemotePath => {
                 self.remote_path.pop();
             }
-            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
+            SetupField::CookieFile => {
+                self.cookie_file_path.pop();
+            }
+            SetupField::Destination | SetupField::CookieSource | SetupField::Browser => {}
         }
     }
 }

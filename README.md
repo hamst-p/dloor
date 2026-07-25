@@ -6,7 +6,9 @@
 
 `dloor` is a Rust TUI multimedia downloader powered by `yt-dlp` and `ffmpeg`. It detects supported social/video URLs automatically and lets you download media as video or audio from a terminal UI.
 
-For content you are authorized to access, dloor can ask `yt-dlp` to read the logged-in session from a supported local browser. dloor stores only the selected browser name in its configuration; it does not copy or save browser cookies itself.
+For content you are authorized to access, dloor can ask `yt-dlp` to read the
+logged-in session from a supported local browser or use a Netscape-format cookie
+file. dloor never reads or copies cookie contents itself.
 
 Supported URL families:
 
@@ -163,7 +165,8 @@ On first launch, choose where downloads should be saved.
 - Local: save files to a local directory
 - Cloud: upload files through an `rclone` remote and remote path
 
-Browser authentication is off by default. Enable it only when a supported URL requires your existing logged-in session.
+Cookie authentication is off by default. Enable a browser session or cookie file
+only when a URL requires credentials you are authorized to use.
 
 If you choose cloud storage, configure `rclone` first:
 
@@ -231,15 +234,16 @@ The `default_quality` value controls the initial selection on each Quality scree
 default_quality = "Compressed"
 ```
 
-Metadata previews use the same optional browser authentication setting as the
-eventual download. Playlist previews are limited to the first five entries;
+Metadata previews use the same optional cookie setting as the eventual download.
+Playlist previews are limited to the first five entries;
 this limit is fixed and does not add a `config.toml` field.
 
 Runtime diagnostics are written to `dloor.log` beside `config.toml`. The file is
 limited to 5 MiB and one `dloor.log.1` backup is retained. Set `RUST_LOG` when
 you need a different log level; dloor logs its own crates at `debug` by default.
 Diagnostic logs intentionally omit download URLs, local and cloud paths, browser
-profiles, command arguments, and raw external-tool error output.
+profiles, cookie-file paths and contents, command arguments, and raw
+external-tool error output.
 
 Download history is stored as `history.jsonl` beside `config.toml`. It contains
 source URLs, titles, platforms, selected format and quality, output paths, status,
@@ -254,11 +258,18 @@ You can reopen the setup screen from inside the app with:
 /settings
 ```
 
-### Browser Authentication
+### Cookie Authentication
 
-Open `/settings`, set `Browser authentication` to `On`, and select the browser where you are already signed in. Supported choices are Chrome, Firefox, Safari, Edge, Brave, Chromium, Vivaldi, and Opera.
+Open `/settings` and set `Cookies` to `Browser`, `File`, or `Do not use`.
+Supported browsers are Chrome, Firefox, Safari, Edge, Brave, Chromium, Vivaldi,
+and Opera. File mode accepts a Netscape-format cookie file path.
 
-dloor then passes the selected browser to `yt-dlp --cookies-from-browser` for each download. The browser profile must be accessible to the current OS user. On macOS, the terminal may ask for Keychain access. Some Chromium-based browsers may need to be fully closed while cookies are read.
+dloor passes the selection to `yt-dlp --cookies-from-browser` or
+`yt-dlp --cookies`; it does not open or parse the cookie file. The browser
+profile must be accessible to the current OS user. On macOS, the terminal may
+ask for Keychain access. Some Chromium-based browsers may need to be fully
+closed while cookies are read. Cookie-file paths and cookie contents are not
+written to dloor's diagnostic log or download history.
 
 Use this only for content you own or are explicitly authorized to download. This feature does not bypass DRM, paywalls, account permissions, or other access controls.
 
@@ -298,13 +309,15 @@ yt-dlp -U
 
 If that does not work, verify that the URL is public and that you have permission to download it.
 
-### Browser Authentication Fails
+### Cookie Authentication Fails
 
 - Confirm that you are signed in to the selected site in the selected browser.
 - Try closing the browser before starting the download.
 - Allow terminal access if macOS prompts for Keychain permission.
+- In file mode, confirm the file exists, is readable, and uses Netscape cookie
+  format.
 - Run `yt-dlp --cookies-from-browser chrome "URL"` directly to inspect the full upstream error, replacing `chrome` with your selected browser.
-- Disable browser authentication again in `/settings` when downloading public content.
+- Disable cookie authentication again in `/settings` when downloading public content.
 
 ## Development
 

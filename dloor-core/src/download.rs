@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
 use crate::{
-    config::{Browser, Config, Destination},
+    config::{sanitized_ytdlp_error, Config, CookieSource, Destination},
     detect_platform, Error, MetadataPreview, Platform, Result,
 };
 
@@ -332,7 +332,7 @@ impl DownloadJob {
         platform: Platform,
         tx: &mpsc::Sender<DownloadEvent>,
     ) -> Result<PathBuf> {
-        let mut args = base_ytdlp_args(output_template, self.config.browser);
+        let mut args = base_ytdlp_args(output_template, &self.config.cookies);
         args.extend(format_args(self.request.format, self.request.quality));
         args.extend(download_target_args(target));
         args.push(OsString::from(&self.request.url));
@@ -340,7 +340,11 @@ impl DownloadJob {
         debug!(
             format = ?self.request.format,
             quality = ?self.request.quality,
-            browser_authentication = self.config.browser.is_some(),
+            cookie_source = match self.config.cookies {
+                CookieSource::None => "none",
+                CookieSource::Browser { .. } => "browser",
+                CookieSource::File { .. } => "file",
+            },
             "spawning yt-dlp"
         );
         let mut child = Command::new("yt-dlp")
@@ -423,11 +427,12 @@ impl DownloadJob {
         };
         let stderr = stderr_messages.join("\n");
         if !status.success() {
-            return Err(Error::ProcessFailed(if stderr.trim().is_empty() {
+            let message = if stderr.trim().is_empty() {
                 format!("yt-dlp exited with {status}")
             } else {
-                stderr
-            }));
+                sanitized_ytdlp_error(&stderr, &self.config.cookies)
+            };
+            return Err(Error::ProcessFailed(message));
         }
         let output_path = output_path.ok_or(Error::MissingOutputFile)?;
         if output_path.extension().is_some_and(|ext| ext == "part")
@@ -491,9 +496,7 @@ impl DownloadJob {
             "--ignore-errors",
         ]);
         command.args(selection_args);
-        if let Some(browser) = self.config.browser {
-            command.args(["--cookies-from-browser", browser.yt_dlp_name()]);
-        }
+        command.args(self.config.cookies.yt_dlp_args());
         command.arg(&self.request.url);
         command
             .kill_on_drop(true)
@@ -536,11 +539,12 @@ impl DownloadJob {
         let stdout = stdout_task.await.unwrap_or_default();
         let stderr = stderr_task.await.unwrap_or_default();
         if !status.success() {
-            return Err(Error::ProcessFailed(if stderr.trim().is_empty() {
+            let message = if stderr.trim().is_empty() {
                 format!("yt-dlp metadata expansion exited with {status}")
             } else {
-                stderr
-            }));
+                sanitized_ytdlp_error(&stderr, &self.config.cookies)
+            };
+            return Err(Error::ProcessFailed(message));
         }
         let entries = parse_playlist_entries(stdout.iter().map(String::as_str), default_target)?;
         if entries.is_empty() {
@@ -648,7 +652,7 @@ const OUTPUT_PREFIX: &str = "DLOOR_OUTPUT|";
 const PLAN_PREFIX: &str = "DLOOR_PLAN|";
 const PROGRESS_PREFIX: &str = "DLOOR_PROGRESS|";
 
-fn base_ytdlp_args(output_template: &Path, browser: Option<Browser>) -> Vec<OsString> {
+fn base_ytdlp_args(output_template: &Path, cookies: &CookieSource) -> Vec<OsString> {
     let mut args = vec![
         "--newline".into(),
         "--progress".into(),
@@ -677,10 +681,7 @@ fn base_ytdlp_args(output_template: &Path, browser: Option<Browser>) -> Vec<OsSt
         "-o".into(),
         output_template.as_os_str().to_os_string(),
     ];
-    if let Some(browser) = browser {
-        args.push("--cookies-from-browser".into());
-        args.push(browser.yt_dlp_name().into());
-    }
+    args.extend(cookies.yt_dlp_args());
     args
 }
 
@@ -1248,7 +1249,7 @@ mod tests {
     #[test]
     fn browser_cookie_args_are_only_added_when_enabled() {
         let output = Path::new("video.%(ext)s");
-        let without_auth = base_ytdlp_args(output, None);
+        let without_auth = base_ytdlp_args(output, &CookieSource::None);
         assert!(!without_auth.contains(&OsString::from("--cookies-from-browser")));
         assert!(without_auth
             .iter()
@@ -1257,7 +1258,12 @@ mod tests {
             .iter()
             .any(|arg| arg == "after_move:DLOOR_OUTPUT|%(filepath)s"));
 
-        let with_auth = base_ytdlp_args(output, Some(Browser::Firefox));
+        let with_auth = base_ytdlp_args(
+            output,
+            &CookieSource::Browser {
+                browser: crate::Browser::Firefox,
+            },
+        );
         assert!(with_auth
             .windows(2)
             .any(|args| args == ["--cookies-from-browser", "firefox"]));

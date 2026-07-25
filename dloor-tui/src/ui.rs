@@ -143,31 +143,41 @@ fn render_setup(
 
     lines.push(Line::from(""));
     lines.push(field_line(
-        "Browser authentication",
-        if state.use_browser_cookies {
-            "On"
-        } else {
-            "Off"
+        "Cookies",
+        match state.cookie_source_index {
+            1 => "Browser",
+            2 => "File",
+            _ => "Do not use",
         },
-        state.field == SetupField::BrowserAuthentication,
+        state.field == SetupField::CookieSource,
     ));
-    if state.use_browser_cookies {
+    if state.cookie_source_index == 1 {
         lines.push(field_line(
             "Browser",
             dloor_core::Browser::ALL[state.browser_index].label(),
             state.field == SetupField::Browser,
         ));
-        lines.push(Line::from(Span::styled(
-            "Uses the selected browser's logged-in session; cookies are not copied by dloor",
-            Style::new().fg(Color::DarkGray),
-        )));
+    } else if state.cookie_source_index == 2 {
+        lines.push(field_line(
+            "Cookie file",
+            &state.cookie_file_path,
+            state.field == SetupField::CookieFile,
+        ));
     }
+    lines.push(Line::from(Span::styled(
+        "Use cookies only for content you own or are authorized to access.",
+        Style::new().fg(Color::Yellow),
+    )));
+    lines.push(Line::from(Span::styled(
+        "dloor passes the selection to yt-dlp and never logs cookie paths or contents.",
+        Style::new().fg(Color::DarkGray),
+    )));
 
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        centered(chunks[1], 82, 16),
+        centered(chunks[1], 88, 18),
     );
     render_footer(frame, chunks[2], "Tab: next field  Enter: save  Esc: back");
 }
@@ -688,10 +698,7 @@ fn destination_label(shared: &SharedState) -> String {
 }
 
 fn authentication_label(shared: &SharedState) -> String {
-    shared.config.browser.map_or_else(
-        || "auth: public content only".to_string(),
-        |browser| format!("auth: {} browser session", browser.label()),
-    )
+    format!("auth: {}", shared.config.cookies.label())
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {

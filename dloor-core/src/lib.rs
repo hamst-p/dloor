@@ -12,7 +12,7 @@ pub mod metadata;
 pub mod platform;
 pub mod queue;
 
-pub use config::{Browser, Config, Destination};
+pub use config::{Browser, Config, CookieSource, Destination};
 pub use deps::{check_dependencies, DependencyReport, Tool};
 pub use download::{
     parse_progress_line, DownloadEvent, DownloadFailure, DownloadItem, DownloadJob,

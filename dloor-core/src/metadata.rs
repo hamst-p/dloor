@@ -7,14 +7,14 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{Browser, DownloadEvent, Error, Result};
+use crate::{config::sanitized_ytdlp_error, CookieSource, DownloadEvent, Error, Result};
 
 pub const PREVIEW_ITEM_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct MetadataRequest {
     pub url: String,
-    pub browser: Option<Browser>,
+    pub cookies: CookieSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +68,7 @@ impl MetadataJob {
 
     async fn run(self) -> Result<MetadataPreview> {
         let mut child = Command::new("yt-dlp")
-            .args(metadata_args(self.request.browser))
+            .args(metadata_args(&self.request.cookies))
             .arg(&self.request.url)
             .kill_on_drop(true)
             .stdout(Stdio::piped())
@@ -108,29 +108,27 @@ impl MetadataJob {
             .map_err(|error| Error::ProcessFailed(error.to_string()))??;
         let stderr = stderr_task.await.unwrap_or_default();
         if !status.success() {
-            return Err(Error::ProcessFailed(if stderr.trim().is_empty() {
+            let message = if stderr.trim().is_empty() {
                 format!("yt-dlp metadata preview exited with {status}")
             } else {
-                stderr
-            }));
+                sanitized_ytdlp_error(&stderr, &self.request.cookies)
+            };
+            return Err(Error::ProcessFailed(message));
         }
         parse_metadata_json(&stdout)
     }
 }
 
-fn metadata_args(browser: Option<Browser>) -> Vec<String> {
+fn metadata_args(cookies: &CookieSource) -> Vec<std::ffi::OsString> {
     let mut args = vec![
-        "--dump-single-json".to_string(),
-        "--flat-playlist".to_string(),
-        "--playlist-end".to_string(),
-        PREVIEW_ITEM_LIMIT.to_string(),
-        "--no-download".to_string(),
-        "--no-warnings".to_string(),
+        "--dump-single-json".into(),
+        "--flat-playlist".into(),
+        "--playlist-end".into(),
+        PREVIEW_ITEM_LIMIT.to_string().into(),
+        "--no-download".into(),
+        "--no-warnings".into(),
     ];
-    if let Some(browser) = browser {
-        args.push("--cookies-from-browser".to_string());
-        args.push(browser.yt_dlp_name().to_string());
-    }
+    args.extend(cookies.yt_dlp_args());
     args
 }
 
@@ -256,7 +254,9 @@ mod tests {
 
     #[test]
     fn metadata_command_limits_playlist_expansion_and_applies_browser_authentication() {
-        let args = metadata_args(Some(Browser::Firefox));
+        let args = metadata_args(&CookieSource::Browser {
+            browser: crate::Browser::Firefox,
+        });
 
         assert!(args.windows(2).any(|args| args == ["--playlist-end", "5"]));
         assert!(args
