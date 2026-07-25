@@ -164,6 +164,12 @@ rclone version
 
 `rclone` can be missing if you only use local downloads.
 
+dloor reads `yt-dlp --version` and `ffmpeg -version` in the background after
+the TUI starts. The results are cached for the current process, so version
+inspection does not block the visible startup path. A date-based yt-dlp version
+more than 90 days old is shown as a main-screen warning, matching yt-dlp's own
+staleness policy.
+
 ## First Run
 
 Start the app:
@@ -207,6 +213,7 @@ Then enter the remote name and remote path in dloor's setup screen.
 - URL input: paste a URL and press `Enter`
 - `/queue`: view, reorder, remove, monitor, or cancel queued jobs
 - `/history`: view retained results and retry a selected failed item with `r`
+- `/update`: confirm and run `yt-dlp -U`, then show the updater output
 - `/settings`: open destination settings
 - `/howtouse`: show the short usage guide
 - `/quit`: quit
@@ -383,6 +390,15 @@ yt-dlp -U
 If that does not work, verify that the URL is public and that you have permission to download it.
 For an unknown host, “Generic (yt-dlp)” means the URL passed dloor's safety and
 syntax checks; it is not a compatibility guarantee.
+
+### yt-dlp Is Reported as Old
+
+The warning appears when the date encoded in `yt-dlp --version` is more than 90
+days old. Run `/update` and confirm to try `yt-dlp -U`. Self-update works for
+official release binaries, but package-managed installations must normally be
+updated by the same manager that installed them. If self-update fails, dloor
+suggests a command for Homebrew, pipx, pip, or the operating-system package
+manager when it can identify one. dloor never updates automatically.
 
 ### Cookie Authentication Fails
 

@@ -126,7 +126,9 @@ impl DownloadQueue {
                 self.active = None;
                 return true;
             }
-            DownloadEvent::PreviewReady { .. }
+            DownloadEvent::DependenciesChecked { .. }
+            | DownloadEvent::YtDlpUpdateFinished { .. }
+            | DownloadEvent::PreviewReady { .. }
             | DownloadEvent::PreviewFailed { .. }
             | DownloadEvent::PreviewCancelled
             | DownloadEvent::Resolving

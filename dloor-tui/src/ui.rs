@@ -9,7 +9,7 @@ use ratatui::{
 use crate::app::{
     ActiveDownload, App, CompleteState, ErrorState, GenericConfirmState, HistoryState, MainState,
     PreviewLoadingState, PreviewState, QualityState, QueueState, Screen, SetupField, SetupState,
-    SharedState,
+    SharedState, UpdateResultState,
 };
 
 const LOGO: &str = r"
@@ -55,6 +55,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
         Screen::Queue(state) => render_queue(frame, state, &app.shared),
         Screen::History(state) => render_history(frame, state, &app.shared),
         Screen::Complete(state) => render_complete(frame, state),
+        Screen::UpdateConfirm => render_update_confirm(frame),
+        Screen::UpdateRunning => render_update_running(frame, app.shared.spinner_index),
+        Screen::UpdateResult(state) => render_update_result(frame, state),
         Screen::ExitConfirm => render_exit_confirm(frame, &app.shared),
         Screen::Error(state) => render_error(frame, state),
     }
@@ -257,7 +260,7 @@ fn on_off(value: bool) -> &'static str {
 }
 
 fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
-    let area = centered(frame.area(), 86, 21);
+    let area = centered(frame.area(), 96, 23);
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -268,6 +271,7 @@ fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Length(2),
         ])
@@ -305,17 +309,103 @@ fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
         body[6],
     );
     frame.render_widget(
-        Paragraph::new(state.url_input.as_str())
-            .block(Block::default().title("Input URL").borders(Borders::ALL)),
+        Paragraph::new(shared.dependency_warning().unwrap_or(""))
+            .alignment(Alignment::Center)
+            .fg(Color::Yellow)
+            .wrap(Wrap { trim: false }),
         body[7],
     );
     frame.render_widget(
-        Paragraph::new("/queue  /history  /howtouse  /settings  /quit")
-            .alignment(Alignment::Center)
-            .fg(Color::DarkGray),
+        Paragraph::new(state.url_input.as_str())
+            .block(Block::default().title("Input URL").borders(Borders::ALL)),
         body[8],
     );
+    frame.render_widget(
+        Paragraph::new("/queue  /history  /update  /howtouse  /settings  /quit")
+            .alignment(Alignment::Center)
+            .fg(Color::DarkGray),
+        body[9],
+    );
     render_footer(frame, footer_area(frame.area()), "Paste URL, then Enter");
+}
+
+fn render_update_confirm(frame: &mut Frame<'_>) {
+    let area = centered(frame.area(), 72, 9);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("Run yt-dlp -U now?").centered().yellow().bold(),
+            Line::from(""),
+            Line::from("This modifies the installed yt-dlp executable when self-update"),
+            Line::from("is supported. Package-managed installs may require another command."),
+            Line::from(""),
+            Line::from("Enter/y: update   Esc/n: cancel")
+                .centered()
+                .dark_gray(),
+        ])
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .title("Update yt-dlp")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_update_running(frame: &mut Frame<'_>, spinner_index: usize) {
+    let chunks = base_layout(frame.area());
+    render_logo(frame, chunks[0]);
+    let spinner = ["|", "/", "-", "\\"][spinner_index % 4];
+    frame.render_widget(
+        Paragraph::new(format!("{spinner} Running yt-dlp -U..."))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title("Updating yt-dlp")
+                    .borders(Borders::ALL),
+            ),
+        centered(chunks[1], 72, 7),
+    );
+}
+
+fn render_update_result(frame: &mut Frame<'_>, state: &UpdateResultState) {
+    let chunks = base_layout(frame.area());
+    render_logo(frame, chunks[0]);
+    let mut lines = vec![
+        Line::from(if state.outcome.success {
+            "yt-dlp update completed"
+        } else {
+            "yt-dlp could not self-update"
+        })
+        .centered()
+        .style(if state.outcome.success {
+            Style::new().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::Red).add_modifier(Modifier::BOLD)
+        }),
+        Line::from(""),
+        Line::from(state.outcome.output.clone()),
+    ];
+    if let Some(hint) = &state.outcome.update_hint {
+        lines.extend([
+            Line::from(""),
+            Line::from("Suggested update method:").yellow(),
+            Line::from(hint.clone()),
+        ]);
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title("Update result")
+                    .borders(Borders::ALL),
+            )
+            .wrap(Wrap { trim: false }),
+        centered(chunks[1], 92, 15),
+    );
+    render_footer(frame, chunks[2], "Enter/Esc: return to main  q: quit");
 }
 
 fn render_how_to_use(frame: &mut Frame<'_>) {

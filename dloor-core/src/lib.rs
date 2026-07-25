@@ -13,7 +13,12 @@ pub mod platform;
 pub mod queue;
 
 pub use config::{BandwidthLimit, Browser, Config, CookieSource, Destination, MediaOptions};
-pub use deps::{check_dependencies, check_media_capabilities, DependencyReport, Tool};
+pub use deps::{
+    check_dependencies, check_dependency_presence, check_media_capabilities, parse_ffmpeg_version,
+    parse_yt_dlp_version, update_hint, DependencyJob, DependencyReport, FfmpegVersion,
+    ParsedToolVersion, Tool, ToolVersion, VersionFreshness, YtDlpUpdateJob, YtDlpUpdateOutcome,
+    YtDlpVersion, YT_DLP_STALE_DAYS,
+};
 pub use download::{
     parse_progress_line, DownloadEvent, DownloadFailure, DownloadItem, DownloadJob,
     DownloadProgress, DownloadRequest, DownloadSuccess, DownloadSummary, DownloadWarning,

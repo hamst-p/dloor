@@ -18,7 +18,8 @@ use crate::{
     config::{
         sanitized_ytdlp_error, BandwidthLimit, Config, CookieSource, Destination, MediaOptions,
     },
-    detect_platform, Error, MetadataPreview, Platform, Result,
+    detect_platform, DependencyReport, Error, MetadataPreview, Platform, Result,
+    YtDlpUpdateOutcome,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -156,6 +157,12 @@ pub struct DownloadSummary {
 
 #[derive(Debug, Clone)]
 pub enum DownloadEvent {
+    DependenciesChecked {
+        report: DependencyReport,
+    },
+    YtDlpUpdateFinished {
+        outcome: YtDlpUpdateOutcome,
+    },
     PreviewReady {
         preview: MetadataPreview,
     },

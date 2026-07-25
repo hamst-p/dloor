@@ -1,11 +1,12 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dloor_core::{
-    check_dependencies, check_media_capabilities, config::default_download_dir, detect_platform,
-    Browser, Config, CookieSource, Destination, DownloadEvent, DownloadItem, DownloadJob,
-    DownloadProgress, DownloadQueue, DownloadRequest, DownloadSummary, Format, HistoryEntry,
-    HistoryStatus, HistoryStore, JobId, MetadataJob, MetadataPreview, MetadataRequest, Platform,
-    PlaylistSelection, Quality, QueueStatus, DEFAULT_HISTORY_LIMIT,
+    check_dependency_presence, check_media_capabilities, config::default_download_dir,
+    detect_platform, Browser, Config, CookieSource, DependencyJob, DependencyReport, Destination,
+    DownloadEvent, DownloadItem, DownloadJob, DownloadProgress, DownloadQueue, DownloadRequest,
+    DownloadSummary, Format, HistoryEntry, HistoryStatus, HistoryStore, JobId, MetadataJob,
+    MetadataPreview, MetadataRequest, Platform, PlaylistSelection, Quality, QueueStatus,
+    YtDlpUpdateJob, YtDlpUpdateOutcome, DEFAULT_HISTORY_LIMIT,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -25,6 +26,9 @@ pub enum Screen {
     Queue(QueueState),
     History(HistoryState),
     Complete(CompleteState),
+    UpdateConfirm,
+    UpdateRunning,
+    UpdateResult(UpdateResultState),
     ExitConfirm,
     Error(ErrorState),
 }
@@ -99,6 +103,11 @@ pub struct CompleteState {
 }
 
 #[derive(Debug)]
+pub struct UpdateResultState {
+    pub outcome: YtDlpUpdateOutcome,
+}
+
+#[derive(Debug)]
 pub struct ErrorState {
     pub message: String,
 }
@@ -159,6 +168,9 @@ pub struct SharedState {
     pub history: HistoryStore,
     pub active_download: Option<ActiveDownload>,
     pub active_preview: Option<ActivePreview>,
+    pub dependency_report: DependencyReport,
+    dependency_receiver: Option<mpsc::Receiver<DownloadEvent>>,
+    update_receiver: Option<mpsc::Receiver<DownloadEvent>>,
     pub notification: Option<String>,
     startup_error: Option<String>,
 }
@@ -223,12 +235,12 @@ impl App {
     pub fn new() -> Result<Self> {
         let first_run = !Config::exists();
         let config = Config::load_or_default()?;
-        let report = check_dependencies(Some(&config));
-        let startup_error = (!report.is_ready()).then(|| report.message());
-        let rclone_available = !report
+        let presence = check_dependency_presence(Some(&config));
+        let startup_error = (!presence.is_ready()).then(|| presence.message());
+        let rclone_available = !presence
             .missing_optional
             .iter()
-            .chain(report.missing_required.iter())
+            .chain(presence.missing_required.iter())
             .any(|tool| tool.command() == "rclone");
         let initial_screen = if first_run {
             Screen::Setup(SetupState::from_config(&config, rclone_available))
@@ -237,6 +249,7 @@ impl App {
         };
         let history = HistoryStore::open(Config::history_path()?, DEFAULT_HISTORY_LIMIT)?;
         let media_warnings = check_media_capabilities(&config.media);
+        let dependency_receiver = Some(DependencyJob::new(config.clone()).spawn());
 
         Ok(Self {
             shared: SharedState {
@@ -248,6 +261,9 @@ impl App {
                 history,
                 active_download: None,
                 active_preview: None,
+                dependency_report: presence,
+                dependency_receiver,
+                update_receiver: None,
                 notification: (!media_warnings.is_empty()).then(|| media_warnings.join(" ")),
                 startup_error,
             },
@@ -261,6 +277,24 @@ impl App {
 
     pub fn tick(&mut self) {
         self.shared.spinner_index = self.shared.spinner_index.wrapping_add(1);
+        if let Some(report) = self.shared.poll_dependency_check() {
+            if let Some(warning) = report.warnings.first() {
+                self.shared.notification = Some(warning.clone());
+            }
+            self.shared.rclone_available = !report
+                .missing_optional
+                .iter()
+                .chain(report.missing_required.iter())
+                .any(|tool| tool.command() == "rclone");
+            self.shared.dependency_report = report;
+        }
+        if let Some(outcome) = self.shared.poll_update() {
+            if matches!(self.navigation.current, Screen::UpdateRunning) {
+                self.navigation
+                    .replace(Screen::UpdateResult(UpdateResultState { outcome }));
+            }
+            self.shared.refresh_dependencies();
+        }
         let preview_terminal = self.shared.poll_preview();
         match preview_terminal {
             Some(PreviewTerminal::Ready(url, preview)) => {
@@ -343,6 +377,9 @@ impl App {
             Screen::Queue(state) => handle_queue_key(state, &mut self.shared, key),
             Screen::History(state) => handle_history_key(state, &mut self.shared, key),
             Screen::Complete(_) => handle_complete_key(key),
+            Screen::UpdateConfirm => handle_update_confirm_key(&mut self.shared, key),
+            Screen::UpdateRunning => Transition::Stay,
+            Screen::UpdateResult(_) => handle_update_result_key(key),
             Screen::ExitConfirm => handle_exit_confirm_key(&mut self.shared, key),
             Screen::Error(_) => handle_error_key(key),
         };
@@ -388,6 +425,44 @@ impl App {
 }
 
 impl SharedState {
+    fn poll_dependency_check(&mut self) -> Option<DependencyReport> {
+        let receiver = self.dependency_receiver.as_mut()?;
+        let event = receiver.try_recv().ok()?;
+        match event {
+            DownloadEvent::DependenciesChecked { report } => {
+                self.dependency_receiver = None;
+                Some(report)
+            }
+            _ => None,
+        }
+    }
+
+    fn refresh_dependencies(&mut self) {
+        self.dependency_receiver = Some(DependencyJob::new(self.config.clone()).spawn());
+    }
+
+    fn start_update(&mut self) {
+        if self.update_receiver.is_none() {
+            self.update_receiver = Some(YtDlpUpdateJob.spawn());
+        }
+    }
+
+    fn poll_update(&mut self) -> Option<YtDlpUpdateOutcome> {
+        let receiver = self.update_receiver.as_mut()?;
+        let event = receiver.try_recv().ok()?;
+        match event {
+            DownloadEvent::YtDlpUpdateFinished { outcome } => {
+                self.update_receiver = None;
+                Some(outcome)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn dependency_warning(&self) -> Option<&str> {
+        self.dependency_report.warnings.first().map(String::as_str)
+    }
+
     fn start_preview(&mut self, url: String) {
         let job = MetadataJob::new(MetadataRequest {
             url: url.clone(),
@@ -405,6 +480,8 @@ impl SharedState {
         let active = self.active_preview.as_mut()?;
         let event = active.receiver.try_recv().ok()?;
         let terminal = match event {
+            DownloadEvent::DependenciesChecked { .. }
+            | DownloadEvent::YtDlpUpdateFinished { .. } => return None,
             DownloadEvent::PreviewReady { preview } => {
                 PreviewTerminal::Ready(active.url.clone(), preview)
             }
@@ -436,7 +513,9 @@ impl SharedState {
                 self.queue.apply_event(active.job_id, &event);
                 self.record_event(&active, &event);
                 match event {
-                    DownloadEvent::PreviewReady { .. }
+                    DownloadEvent::DependenciesChecked { .. }
+                    | DownloadEvent::YtDlpUpdateFinished { .. }
+                    | DownloadEvent::PreviewReady { .. }
                     | DownloadEvent::PreviewFailed { .. }
                     | DownloadEvent::PreviewCancelled => {}
                     DownloadEvent::Resolving => {
@@ -569,7 +648,9 @@ impl SharedState {
                     HistoryStatus::Cancelled,
                 )),
             },
-            DownloadEvent::PreviewReady { .. }
+            DownloadEvent::DependenciesChecked { .. }
+            | DownloadEvent::YtDlpUpdateFinished { .. }
+            | DownloadEvent::PreviewReady { .. }
             | DownloadEvent::PreviewFailed { .. }
             | DownloadEvent::PreviewCancelled
             | DownloadEvent::Resolving
@@ -787,6 +868,10 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
                 state.url_input.clear();
                 return Transition::Push(Screen::History(HistoryState::default()));
             }
+            if input == "/update" {
+                state.url_input.clear();
+                return Transition::Push(Screen::UpdateConfirm);
+            }
             match detect_platform(&input) {
                 Ok(Platform::Generic) if shared.config.confirm_generic_urls => {
                     Transition::Push(Screen::GenericConfirm(GenericConfirmState { url: input }))
@@ -806,6 +891,25 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
             state.url_input.push(ch);
             Transition::Stay
         }
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_update_confirm_key(shared: &mut SharedState, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+            shared.start_update();
+            Transition::Push(Screen::UpdateRunning)
+        }
+        KeyCode::Esc | KeyCode::Char('n' | 'N') => Transition::Back,
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_update_result_key(key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => Transition::ReturnToMain { clear_input: true },
+        KeyCode::Char('q') => Transition::Quit,
         _ => Transition::Stay,
     }
 }
@@ -1390,6 +1494,9 @@ mod tests {
             history,
             active_download: None,
             active_preview: None,
+            dependency_report: DependencyReport::default(),
+            dependency_receiver: None,
+            update_receiver: None,
             notification: None,
             startup_error: None,
         }
