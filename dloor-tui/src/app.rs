@@ -181,6 +181,7 @@ pub enum SetupField {
     Browser,
     CookieFile,
     GenericConfirmation,
+    ClipboardAutofill,
     BandwidthLimit,
     WriteSubtitles,
     EmbedSubtitles,
@@ -201,6 +202,7 @@ pub struct SetupState {
     pub browser_index: usize,
     pub cookie_file_path: String,
     pub confirm_generic_urls: bool,
+    pub clipboard_autofill: bool,
     pub bandwidth_limit: String,
     pub write_subtitles: bool,
     pub embed_subtitles: bool,
@@ -225,6 +227,9 @@ pub struct SharedState {
     dependency_receiver: Option<mpsc::Receiver<DownloadEvent>>,
     update_receiver: Option<mpsc::Receiver<DownloadEvent>>,
     clipboard: ClipboardService,
+    clipboard_receiver: Option<mpsc::Receiver<String>>,
+    clipboard_checked_for_main: bool,
+    last_clipboard_candidate: Option<String>,
     pub notification: Option<String>,
     startup_error: Option<String>,
 }
@@ -319,6 +324,9 @@ impl App {
                 dependency_receiver,
                 update_receiver: None,
                 clipboard: ClipboardService::new(),
+                clipboard_receiver: None,
+                clipboard_checked_for_main: false,
+                last_clipboard_candidate: None,
                 notification: (!media_warnings.is_empty()).then(|| media_warnings.join(" ")),
                 startup_error,
             },
@@ -332,6 +340,7 @@ impl App {
 
     pub fn tick(&mut self) {
         self.shared.spinner_index = self.shared.spinner_index.wrapping_add(1);
+        self.refresh_clipboard_autofill();
         if let Some(report) = self.shared.poll_dependency_check() {
             if let Some(warning) = report.warnings.first() {
                 self.shared.notification = Some(warning.clone());
@@ -412,6 +421,35 @@ impl App {
         }
     }
 
+    fn refresh_clipboard_autofill(&mut self) {
+        let Screen::Main(state) = &mut self.navigation.current else {
+            self.shared.leave_main_clipboard_context();
+            return;
+        };
+
+        if !self.shared.clipboard_checked_for_main {
+            self.shared.clipboard_checked_for_main = true;
+            if self.shared.config.clipboard_autofill && state.url_input.is_empty() {
+                self.shared.start_clipboard_read();
+            }
+        }
+
+        let Some(raw) = self.shared.poll_clipboard_read() else {
+            return;
+        };
+        let Some(candidate) = clipboard_url_candidate(
+            &raw,
+            &state.url_input,
+            self.shared.last_clipboard_candidate.as_deref(),
+        ) else {
+            return;
+        };
+        state.url_input.clone_from(&candidate);
+        self.shared.last_clipboard_candidate = Some(candidate);
+        self.shared.notification =
+            Some("URL prefilled from the clipboard; review it before pressing Enter".to_string());
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.shared.cancel_all();
@@ -487,6 +525,40 @@ impl App {
 }
 
 impl SharedState {
+    fn start_clipboard_read(&mut self) {
+        if self.clipboard_receiver.is_some() {
+            return;
+        }
+        let clipboard = self.clipboard.clone();
+        let (sender, receiver) = mpsc::channel(1);
+        self.clipboard_receiver = Some(receiver);
+        tokio::task::spawn_blocking(move || {
+            if let Ok(text) = clipboard.read_text() {
+                let _ = sender.blocking_send(text);
+            }
+        });
+    }
+
+    fn poll_clipboard_read(&mut self) -> Option<String> {
+        let receiver = self.clipboard_receiver.as_mut()?;
+        match receiver.try_recv() {
+            Ok(text) => {
+                self.clipboard_receiver = None;
+                Some(text)
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.clipboard_receiver = None;
+                None
+            }
+            Err(mpsc::error::TryRecvError::Empty) => None,
+        }
+    }
+
+    fn leave_main_clipboard_context(&mut self) {
+        self.clipboard_checked_for_main = false;
+        self.clipboard_receiver = None;
+    }
+
     fn poll_dependency_check(&mut self) -> Option<DependencyReport> {
         let receiver = self.dependency_receiver.as_mut()?;
         let event = receiver.try_recv().ok()?;
@@ -850,6 +922,19 @@ impl Navigation {
     }
 }
 
+fn clipboard_url_candidate(
+    raw: &str,
+    current_input: &str,
+    last_candidate: Option<&str>,
+) -> Option<String> {
+    let candidate = raw.trim();
+    if !current_input.is_empty() || candidate.is_empty() || last_candidate == Some(candidate) {
+        return None;
+    }
+    detect_platform(candidate).ok()?;
+    Some(candidate.to_string())
+}
+
 fn handle_setup_key(state: &mut SetupState, shared: &mut SharedState, key: KeyEvent) -> Transition {
     match key.code {
         KeyCode::Esc if !shared.first_run => return Transition::Back,
@@ -866,6 +951,9 @@ fn handle_setup_key(state: &mut SetupState, shared: &mut SharedState, key: KeyEv
         }
         KeyCode::Left | KeyCode::Right if state.field == SetupField::GenericConfirmation => {
             state.confirm_generic_urls = !state.confirm_generic_urls;
+        }
+        KeyCode::Left | KeyCode::Right if state.field == SetupField::ClipboardAutofill => {
+            state.clipboard_autofill = !state.clipboard_autofill;
         }
         KeyCode::Left | KeyCode::Right if state.field == SetupField::WriteSubtitles => {
             state.write_subtitles = !state.write_subtitles;
@@ -1354,6 +1442,7 @@ fn save_setup(state: &SetupState, shared: &mut SharedState) -> Result<()> {
         _ => unreachable!("cookie source selection is always normalized"),
     };
     shared.config.confirm_generic_urls = state.confirm_generic_urls;
+    shared.config.clipboard_autofill = state.clipboard_autofill;
     shared.config.bandwidth_limit = if state.bandwidth_limit.trim().is_empty() {
         None
     } else {
@@ -1409,6 +1498,7 @@ impl SetupState {
                 browser_index,
                 cookie_file_path,
                 confirm_generic_urls: config.confirm_generic_urls,
+                clipboard_autofill: config.clipboard_autofill,
                 bandwidth_limit: config
                     .bandwidth_limit
                     .as_ref()
@@ -1431,6 +1521,7 @@ impl SetupState {
                 browser_index,
                 cookie_file_path,
                 confirm_generic_urls: config.confirm_generic_urls,
+                clipboard_autofill: config.clipboard_autofill,
                 bandwidth_limit: config
                     .bandwidth_limit
                     .as_ref()
@@ -1484,6 +1575,7 @@ impl SetupState {
         }
         fields.extend([
             SetupField::GenericConfirmation,
+            SetupField::ClipboardAutofill,
             SetupField::BandwidthLimit,
             SetupField::WriteSubtitles,
             SetupField::EmbedSubtitles,
@@ -1507,6 +1599,7 @@ impl SetupState {
             | SetupField::CookieSource
             | SetupField::Browser
             | SetupField::GenericConfirmation
+            | SetupField::ClipboardAutofill
             | SetupField::WriteSubtitles
             | SetupField::EmbedSubtitles
             | SetupField::AutoSubtitles
@@ -1539,6 +1632,7 @@ impl SetupState {
             | SetupField::CookieSource
             | SetupField::Browser
             | SetupField::GenericConfirmation
+            | SetupField::ClipboardAutofill
             | SetupField::WriteSubtitles
             | SetupField::EmbedSubtitles
             | SetupField::AutoSubtitles
@@ -1591,6 +1685,9 @@ mod tests {
             dependency_receiver: None,
             update_receiver: None,
             clipboard: ClipboardService::unavailable(),
+            clipboard_receiver: None,
+            clipboard_checked_for_main: false,
+            last_clipboard_candidate: None,
             notification: None,
             startup_error: None,
         }
@@ -1685,5 +1782,40 @@ mod tests {
             playlist: None,
         };
         assert_eq!(metadata_qualities(&preview), [Quality::P1080]);
+    }
+
+    #[test]
+    fn clipboard_candidates_must_be_valid_new_urls() {
+        assert_eq!(
+            clipboard_url_candidate(" https://youtube.com/watch?v=example \n", "", None),
+            Some("https://youtube.com/watch?v=example".to_string())
+        );
+        assert_eq!(
+            clipboard_url_candidate("https://media.example/video/1", "", None),
+            Some("https://media.example/video/1".to_string())
+        );
+        assert_eq!(
+            clipboard_url_candidate(
+                "https://media.example/video/1",
+                "",
+                Some("https://media.example/video/1")
+            ),
+            None
+        );
+        assert_eq!(
+            clipboard_url_candidate(
+                "https://youtube.com/watch?v=clipboard",
+                "https://youtube.com/watch?v=typed",
+                None
+            ),
+            None
+        );
+        for invalid in ["", "not a URL", "youtube.com/watch?v=example", "--exec=bad"] {
+            assert_eq!(
+                clipboard_url_candidate(invalid, "", None),
+                None,
+                "{invalid}"
+            );
+        }
     }
 }

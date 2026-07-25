@@ -180,6 +180,11 @@ fn render_setup(
         state.field == SetupField::GenericConfirmation,
     ));
     lines.push(field_line(
+        "Clipboard URL detection",
+        on_off(state.clipboard_autofill),
+        state.field == SetupField::ClipboardAutofill,
+    ));
+    lines.push(field_line(
         "Bandwidth limit",
         if state.bandwidth_limit.is_empty() {
             "Unlimited"

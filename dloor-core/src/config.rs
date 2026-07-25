@@ -180,6 +180,7 @@ pub struct Config {
     pub default_quality: Quality,
     pub cookies: CookieSource,
     pub confirm_generic_urls: bool,
+    pub clipboard_autofill: bool,
     pub media: MediaOptions,
     pub bandwidth_limit: Option<BandwidthLimit>,
 }
@@ -194,6 +195,8 @@ struct ConfigFile {
     browser: Option<Browser>,
     #[serde(default = "default_confirm_generic_urls")]
     confirm_generic_urls: bool,
+    #[serde(default = "default_clipboard_autofill")]
+    clipboard_autofill: bool,
     #[serde(default)]
     media: MediaOptions,
     #[serde(default)]
@@ -216,6 +219,7 @@ impl<'de> serde::Deserialize<'de> for Config {
                     })
             }),
             confirm_generic_urls: file.confirm_generic_urls,
+            clipboard_autofill: file.clipboard_autofill,
             media: file.media,
             bandwidth_limit: file.bandwidth_limit,
         })
@@ -231,6 +235,7 @@ impl Default for Config {
             default_quality: Quality::Best,
             cookies: CookieSource::None,
             confirm_generic_urls: default_confirm_generic_urls(),
+            clipboard_autofill: default_clipboard_autofill(),
             media: MediaOptions::default(),
             bandwidth_limit: None,
         }
@@ -238,6 +243,10 @@ impl Default for Config {
 }
 
 const fn default_confirm_generic_urls() -> bool {
+    true
+}
+
+const fn default_clipboard_autofill() -> bool {
     true
 }
 
@@ -377,6 +386,7 @@ mod tests {
                 browser: Browser::Firefox,
             },
             confirm_generic_urls: false,
+            clipboard_autofill: false,
             media: MediaOptions {
                 write_subtitles: true,
                 embed_subtitles: true,
@@ -407,6 +417,7 @@ path = "/tmp"
 
         assert_eq!(config.cookies, CookieSource::None);
         assert!(config.confirm_generic_urls);
+        assert!(config.clipboard_autofill);
         assert_eq!(config.media, MediaOptions::default());
         assert_eq!(config.bandwidth_limit, None);
     }
@@ -432,6 +443,7 @@ path = "/tmp"
             }
         );
         assert!(config.confirm_generic_urls);
+        assert!(config.clipboard_autofill);
         assert_eq!(config.media, MediaOptions::default());
         assert_eq!(config.bandwidth_limit, None);
         let serialized = toml::to_string(&config).unwrap();

@@ -196,7 +196,8 @@ Then enter the remote name and remote path in dloor's setup screen.
 
 ## Usage
 
-1. Paste a supported URL into the main screen.
+1. Paste a supported URL into the main screen, or review the URL prefilled from
+   the clipboard.
 2. Press `Enter`.
 3. For an unknown host, confirm that you want to try yt-dlp.
 4. Wait for the cancellable metadata preview and verify the title, uploader,
@@ -289,6 +290,18 @@ this limit is fixed and does not add a `config.toml` field.
 does not contain it. Choosing `a` on the unverified-host screen stores `false`
 globally for all unknown hosts. Open `/settings` and set `Confirm generic URLs`
 to `Always` to restore the prompt.
+
+`clipboard_autofill` also defaults to `true` for existing configuration files.
+At startup and whenever the main screen is re-entered, dloor reads clipboard
+text in a background task and prefills an empty input only when the entire text
+is a valid URL. It never starts a download automatically and never replaces
+typed input. A URL removed by the user is not proposed again during that
+process. Generic URLs still require the configured unverified-host confirmation.
+Set `Clipboard URL detection` to `Off` in `/settings`, or use:
+
+```toml
+clipboard_autofill = false
+```
 
 Runtime diagnostics are written to `dloor.log` beside `config.toml`. The file is
 limited to 5 MiB and one `dloor.log.1` backup is retained. Set `RUST_LOG` when
@@ -398,6 +411,13 @@ yt-dlp -U
 If that does not work, verify that the URL is public and that you have permission to download it.
 For an unknown host, “Generic (yt-dlp)” means the URL passed dloor's safety and
 syntax checks; it is not a compatibility guarantee.
+
+### Clipboard URL Detection Is Unavailable
+
+Clipboard access is optional. Headless sessions, SSH, and some Wayland
+compositors may not expose a readable text clipboard; dloor silently continues
+with an empty URL field. Paste manually, or disable `Clipboard URL detection` in
+`/settings`. dloor does not log clipboard contents or access failures.
 
 ### yt-dlp Is Reported as Old
 
