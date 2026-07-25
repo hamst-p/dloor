@@ -7,7 +7,9 @@
 pub mod config;
 pub mod deps;
 pub mod download;
+pub mod history;
 pub mod platform;
+pub mod queue;
 
 pub use config::{Browser, Config, Destination};
 pub use deps::{check_dependencies, DependencyReport, Tool};
@@ -16,7 +18,9 @@ pub use download::{
     DownloadProgress, DownloadRequest, DownloadSuccess, DownloadSummary, Format, PlaylistSelection,
     Quality,
 };
+pub use history::{HistoryEntry, HistoryStatus, HistoryStore, DEFAULT_HISTORY_LIMIT};
 pub use platform::{detect_platform, Platform};
+pub use queue::{DownloadQueue, JobId, QueueStatus, QueuedJob};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -32,6 +36,8 @@ pub enum Error {
     TomlDecode(#[from] toml::de::Error),
     #[error("TOML encode error: {0}")]
     TomlEncode(#[from] toml::ser::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
     #[error("missing required tool: {0}")]
     MissingTool(&'static str),
     #[error("process failed: {0}")]

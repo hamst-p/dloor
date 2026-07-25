@@ -101,6 +101,10 @@ impl Config {
         Ok(Self::config_dir()?.join("dloor.log"))
     }
 
+    pub fn history_path() -> Result<PathBuf> {
+        Ok(Self::config_dir()?.join("history.jsonl"))
+    }
+
     pub fn exists() -> bool {
         Self::config_path().is_ok_and(|path| path.exists())
     }

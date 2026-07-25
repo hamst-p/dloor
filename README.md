@@ -28,6 +28,10 @@ dloor is early-stage OSS software. The local download flow is the primary suppor
 - Expand an authorized playlist and process its items sequentially
 - Continue a playlist after individual item failures and report a final summary
 - Show separate current-item and overall playlist progress
+- Queue multiple downloads while one job runs in the background
+- Reorder, remove, monitor, or cancel queued jobs
+- Keep the latest 500 item results in a local JSON Lines history
+- Retry a failed playlist item without repeating successful items
 - Save locally or upload through an optional `rclone` remote
 
 ## Quick Start
@@ -174,12 +178,15 @@ Then enter the remote name and remote path in dloor's setup screen.
 3. Choose whether to download one item or the entire playlist.
 4. Choose `Video` or `Audio`.
 5. Choose `Best` or `Compressed`.
-6. Follow the current-item and overall progress bars.
-7. Review the successful paths and any failed items in the completion summary.
+6. The job is added to the queue and the main screen is ready for another URL.
+7. Open `/queue` to monitor current-item and overall progress.
+8. Open `/history` to review saved paths, failures, or retry a failed item.
 
 ## Key Commands
 
 - URL input: paste a URL and press `Enter`
+- `/queue`: view, reorder, remove, monitor, or cancel queued jobs
+- `/history`: view retained results and retry a selected failed item with `r`
 - `/settings`: open destination settings
 - `/howtouse`: show the short usage guide
 - `/quit`: quit
@@ -187,8 +194,15 @@ Then enter the remote name and remote path in dloor's setup screen.
 - `Esc`: go back, or quit from the URL input screen
 - `Esc` during a download: cancel the active `yt-dlp`, `ffmpeg`, or `rclone` process
 - Arrow keys: move between scope, format, and quality choices
+- Queue screen `Ctrl+Up` / `Ctrl+Down`: reorder a waiting job
+- Queue screen `c`: cancel the selected job
+- Queue screen `d`: remove the selected waiting job without adding a history record
+- Queue screen `Enter`: monitor the selected job
 - `Tab`: move between setup fields
 - `Enter`: confirm
+
+When unfinished jobs exist, a normal quit asks for confirmation. Confirming cancels
+the active process and discards waiting jobs before the application exits.
 
 ## Quality Presets
 
@@ -217,6 +231,13 @@ limited to 5 MiB and one `dloor.log.1` backup is retained. Set `RUST_LOG` when
 you need a different log level; dloor logs its own crates at `debug` by default.
 Diagnostic logs intentionally omit download URLs, local and cloud paths, browser
 profiles, command arguments, and raw external-tool error output.
+
+Download history is stored as `history.jsonl` beside `config.toml`. It contains
+source URLs, titles, platforms, selected format and quality, output paths, status,
+and an RFC 3339 UTC timestamp. The newest 500 entries are retained. Unlike the
+diagnostic log, this file intentionally contains URLs and paths so failed items
+can be retried; protect the config directory as personal data. On Unix, dloor
+creates the history file with owner-only permissions where supported.
 
 You can reopen the setup screen from inside the app with:
 

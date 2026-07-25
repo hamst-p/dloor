@@ -2,8 +2,9 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dloor_core::{
     check_dependencies, config::default_download_dir, detect_platform, Browser, Config,
-    Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress, DownloadRequest,
-    DownloadSummary, Format, Platform, PlaylistSelection, Quality,
+    Destination, DownloadEvent, DownloadItem, DownloadJob, DownloadProgress, DownloadQueue,
+    DownloadRequest, DownloadSummary, Format, HistoryEntry, HistoryStatus, HistoryStore, JobId,
+    Platform, PlaylistSelection, Quality, QueueStatus, DEFAULT_HISTORY_LIMIT,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -17,7 +18,10 @@ pub enum Screen {
     Format(FormatState),
     Quality(QualityState),
     Download(DownloadViewState),
+    Queue(QueueState),
+    History(HistoryState),
     Complete(CompleteState),
+    ExitConfirm,
     Error(ErrorState),
 }
 
@@ -47,8 +51,20 @@ pub struct QualityState {
     pub selected: usize,
 }
 
+#[derive(Debug)]
+pub struct DownloadViewState {
+    pub job_id: JobId,
+}
+
 #[derive(Debug, Default)]
-pub struct DownloadViewState;
+pub struct QueueState {
+    pub selected: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct HistoryState {
+    pub selected: usize,
+}
 
 #[derive(Debug)]
 pub struct CompleteState {
@@ -93,13 +109,18 @@ pub struct SharedState {
     pub first_run: bool,
     pub rclone_available: bool,
     pub spinner_index: usize,
+    pub queue: DownloadQueue,
+    pub history: HistoryStore,
     pub active_download: Option<ActiveDownload>,
+    pub notification: Option<String>,
     startup_error: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct ActiveDownload {
-    pub platform: Option<Platform>,
+    pub job_id: JobId,
+    pub request: DownloadRequest,
+    pub platform: Platform,
     pub item: Option<DownloadItem>,
     pub progress: Option<DownloadProgress>,
     pub status_text: String,
@@ -117,18 +138,18 @@ pub struct Navigation {
 enum Transition {
     Stay,
     Push(Screen),
-    Replace(Screen),
     Back,
     ReturnToMain { clear_input: bool },
     ShowError(String),
     Quit,
+    ForceQuit,
 }
 
 #[derive(Debug)]
 enum DownloadTerminal {
-    Finished(DownloadSummary),
-    Failed(String),
-    Cancelled(DownloadSummary),
+    Finished(JobId, DownloadSummary),
+    Failed(JobId, String),
+    Cancelled(JobId, DownloadSummary),
 }
 
 #[derive(Debug)]
@@ -153,6 +174,7 @@ impl App {
         } else {
             Screen::Main(MainState::default())
         };
+        let history = HistoryStore::open(Config::history_path()?, DEFAULT_HISTORY_LIMIT)?;
 
         Ok(Self {
             shared: SharedState {
@@ -160,7 +182,10 @@ impl App {
                 first_run,
                 rclone_available,
                 spinner_index: 0,
+                queue: DownloadQueue::new(),
+                history,
                 active_download: None,
+                notification: None,
                 startup_error,
             },
             navigation: Navigation::new(initial_screen),
@@ -173,19 +198,42 @@ impl App {
 
     pub fn tick(&mut self) {
         self.shared.spinner_index = self.shared.spinner_index.wrapping_add(1);
-        let terminal = self.shared.poll_download();
+        let monitored_job = match &self.navigation.current {
+            Screen::Download(state) => Some(state.job_id),
+            _ => None,
+        };
+        let terminal = self.shared.poll_queue();
         match terminal {
-            Some(DownloadTerminal::Finished(summary)) => {
-                self.navigation
-                    .replace(Screen::Complete(CompleteState { summary }));
-            }
-            Some(DownloadTerminal::Failed(error)) => self.navigation.show_error(error),
-            Some(DownloadTerminal::Cancelled(summary)) => {
-                if summary.succeeded.is_empty() && summary.failed.is_empty() {
-                    self.navigation.return_to_main(false);
-                } else {
+            Some(DownloadTerminal::Finished(job_id, summary)) => {
+                if monitored_job == Some(job_id) {
                     self.navigation
                         .replace(Screen::Complete(CompleteState { summary }));
+                } else {
+                    self.shared.notification = Some(format!(
+                        "Job {} finished: {} succeeded, {} failed",
+                        job_id.0,
+                        summary.succeeded.len(),
+                        summary.failed.len()
+                    ));
+                }
+            }
+            Some(DownloadTerminal::Failed(job_id, error)) => {
+                if monitored_job == Some(job_id) {
+                    self.navigation.show_error(error);
+                } else {
+                    self.shared.notification = Some(format!("Job {} failed", job_id.0));
+                }
+            }
+            Some(DownloadTerminal::Cancelled(job_id, summary)) => {
+                if monitored_job == Some(job_id) {
+                    if summary.succeeded.is_empty() && summary.failed.is_empty() {
+                        self.navigation.return_to_main(false);
+                    } else {
+                        self.navigation
+                            .replace(Screen::Complete(CompleteState { summary }));
+                    }
+                } else {
+                    self.shared.notification = Some(format!("Job {} cancelled", job_id.0));
                 }
             }
             None => {}
@@ -194,7 +242,7 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.shared.cancel_active_download();
+            self.shared.cancel_all();
             return AppAction::Quit;
         }
 
@@ -205,8 +253,11 @@ impl App {
             Screen::Playlist(state) => handle_playlist_key(state, key),
             Screen::Format(state) => handle_format_key(state, &self.shared, key),
             Screen::Quality(state) => handle_quality_key(state, &mut self.shared, key),
-            Screen::Download(_) => handle_download_key(&mut self.shared, key),
+            Screen::Download(state) => handle_download_key(state, &mut self.shared, key),
+            Screen::Queue(state) => handle_queue_key(state, &mut self.shared, key),
+            Screen::History(state) => handle_history_key(state, &mut self.shared, key),
             Screen::Complete(_) => handle_complete_key(key),
+            Screen::ExitConfirm => handle_exit_confirm_key(&mut self.shared, key),
             Screen::Error(_) => handle_error_key(key),
         };
         self.apply_transition(transition)
@@ -228,7 +279,6 @@ impl App {
         match transition {
             Transition::Stay => {}
             Transition::Push(screen) => self.navigation.push(screen),
-            Transition::Replace(screen) => self.navigation.replace(screen),
             Transition::Back => {
                 if !self.navigation.back() {
                     return AppAction::Quit;
@@ -238,19 +288,103 @@ impl App {
                 self.navigation.return_to_main(clear_input);
             }
             Transition::ShowError(message) => self.navigation.show_error(message),
-            Transition::Quit => return AppAction::Quit,
+            Transition::Quit => {
+                if self.shared.queue.has_unfinished() {
+                    self.navigation.push(Screen::ExitConfirm);
+                } else {
+                    return AppAction::Quit;
+                }
+            }
+            Transition::ForceQuit => return AppAction::Quit,
         }
         AppAction::Continue
     }
 }
 
 impl SharedState {
-    fn start_download(&mut self, request: DownloadRequest) {
-        let platform = detect_platform(&request.url).ok();
-        let job = DownloadJob::new(request, self.config.clone());
+    fn enqueue(&mut self, request: DownloadRequest, title: String) -> JobId {
+        let platform = detect_platform(&request.url).expect("validated URL is queued");
+        let id = self.queue.enqueue(request, title, platform);
+        self.notification = Some(format!("Job {} added to the queue", id.0));
+        id
+    }
+
+    fn poll_queue(&mut self) -> Option<DownloadTerminal> {
+        let mut terminal = None;
+        if let Some(mut active) = self.active_download.take() {
+            while let Ok(event) = active.receiver.try_recv() {
+                self.queue.apply_event(active.job_id, &event);
+                self.record_event(&active, &event);
+                match event {
+                    DownloadEvent::Resolving => {
+                        active.status_text = "Resolving items...".to_string();
+                    }
+                    DownloadEvent::ItemStarted { item, platform } => {
+                        active.platform = platform;
+                        active.item = Some(item);
+                        active.progress = None;
+                        active.status_text = "Starting item...".to_string();
+                    }
+                    DownloadEvent::Progress {
+                        progress,
+                        item,
+                        platform,
+                    } => {
+                        active.platform = platform;
+                        active.item = Some(item);
+                        active.status_text = "Downloading".to_string();
+                        active.progress = Some(progress);
+                    }
+                    DownloadEvent::Converting { item } => {
+                        active.item = Some(item);
+                        active.status_text = "Converting...".to_string();
+                    }
+                    DownloadEvent::Uploading { item } => {
+                        active.item = Some(item);
+                        active.status_text = "Uploading...".to_string();
+                    }
+                    DownloadEvent::ItemCompleted { result } => {
+                        active.item = Some(result.item);
+                        active.status_text = "Item completed".to_string();
+                    }
+                    DownloadEvent::ItemFailed { failure } => {
+                        active.item = Some(failure.item);
+                        active.status_text = "Item failed; continuing...".to_string();
+                    }
+                    DownloadEvent::Finished { summary } => {
+                        terminal = Some(DownloadTerminal::Finished(active.job_id, summary));
+                    }
+                    DownloadEvent::Failed { error } => {
+                        terminal = Some(DownloadTerminal::Failed(active.job_id, error));
+                    }
+                    DownloadEvent::Cancelled { summary } => {
+                        terminal = Some(DownloadTerminal::Cancelled(active.job_id, summary));
+                    }
+                }
+            }
+            if terminal.is_none() {
+                self.active_download = Some(active);
+            } else {
+                self.queue.remove_terminal(active.job_id);
+            }
+        }
+
+        if self.active_download.is_none() {
+            self.start_next();
+        }
+        terminal
+    }
+
+    fn start_next(&mut self) {
+        let Some(queued) = self.queue.start_next() else {
+            return;
+        };
+        let job = DownloadJob::new(queued.request.clone(), self.config.clone());
         let cancellation = job.cancellation_token();
         self.active_download = Some(ActiveDownload {
-            platform,
+            job_id: queued.id,
+            request: queued.request,
+            platform: queued.platform,
             item: None,
             progress: None,
             status_text: "Starting download...".to_string(),
@@ -259,68 +393,132 @@ impl SharedState {
         });
     }
 
-    fn poll_download(&mut self) -> Option<DownloadTerminal> {
-        let active = self.active_download.as_mut()?;
-        let mut terminal = None;
-        while let Ok(event) = active.receiver.try_recv() {
-            match event {
-                DownloadEvent::Resolving => {
-                    active.status_text = "Resolving items...".to_string();
+    fn record_event(&mut self, active: &ActiveDownload, event: &DownloadEvent) {
+        let entry = match event {
+            DownloadEvent::ItemCompleted { result } => Some(HistoryEntry::succeeded(
+                &active.request,
+                active.platform,
+                result,
+            )),
+            DownloadEvent::ItemFailed { failure } => Some(HistoryEntry::failed(
+                &active.request,
+                active.platform,
+                failure,
+            )),
+            DownloadEvent::Failed { .. } => Some(HistoryEntry::unfinished(
+                &active.request,
+                active.platform,
+                active
+                    .item
+                    .as_ref()
+                    .map_or_else(|| "Download job".to_string(), |item| item.title.clone()),
+                HistoryStatus::Failed,
+            )),
+            DownloadEvent::Cancelled { summary } => match active.item.as_ref() {
+                Some(item) => {
+                    let already_recorded = summary
+                        .succeeded
+                        .iter()
+                        .any(|result| result.item.playlist_index == item.playlist_index)
+                        || summary
+                            .failed
+                            .iter()
+                            .any(|failure| failure.item.playlist_index == item.playlist_index);
+                    (!already_recorded).then(|| {
+                        HistoryEntry::unfinished(
+                            &active.request,
+                            active.platform,
+                            item.title.clone(),
+                            HistoryStatus::Cancelled,
+                        )
+                    })
                 }
-                DownloadEvent::ItemStarted { item, platform } => {
-                    active.platform = Some(platform);
-                    active.item = Some(item);
-                    active.progress = None;
-                    active.status_text = "Starting item...".to_string();
-                }
-                DownloadEvent::Progress {
-                    progress,
-                    item,
-                    platform,
-                } => {
-                    active.platform = Some(platform);
-                    active.item = Some(item);
-                    active.status_text = "Downloading".to_string();
-                    active.progress = Some(progress);
-                }
-                DownloadEvent::Converting { item } => {
-                    active.item = Some(item);
-                    active.status_text = "Converting...".to_string();
-                }
-                DownloadEvent::Uploading { item } => {
-                    active.item = Some(item);
-                    active.status_text = "Uploading...".to_string();
-                }
-                DownloadEvent::ItemCompleted { result } => {
-                    active.item = Some(result.item);
-                    active.status_text = "Item completed".to_string();
-                }
-                DownloadEvent::ItemFailed { failure } => {
-                    active.item = Some(failure.item);
-                    active.status_text = "Item failed; continuing...".to_string();
-                }
-                DownloadEvent::Finished { summary } => {
-                    terminal = Some(DownloadTerminal::Finished(summary));
-                }
-                DownloadEvent::Failed { error } => {
-                    terminal = Some(DownloadTerminal::Failed(error));
-                }
-                DownloadEvent::Cancelled { summary } => {
-                    terminal = Some(DownloadTerminal::Cancelled(summary));
-                }
+                None => Some(HistoryEntry::unfinished(
+                    &active.request,
+                    active.platform,
+                    self.queue
+                        .entry(active.job_id)
+                        .map_or_else(|| "Download job".to_string(), |job| job.title.clone()),
+                    HistoryStatus::Cancelled,
+                )),
+            },
+            DownloadEvent::Resolving
+            | DownloadEvent::ItemStarted { .. }
+            | DownloadEvent::Progress { .. }
+            | DownloadEvent::Converting { .. }
+            | DownloadEvent::Uploading { .. }
+            | DownloadEvent::Finished { .. } => None,
+        };
+        if let Some(entry) = entry {
+            if let Err(error) = self.history.append(entry) {
+                self.notification = Some(format!("Could not update history: {error}"));
             }
         }
-        if terminal.is_some() {
-            self.active_download = None;
-        }
-        terminal
     }
 
-    fn cancel_active_download(&mut self) {
+    fn cancel_job(&mut self, id: JobId) {
+        if self.active_download.as_ref().map(|active| active.job_id) == Some(id) {
+            if let Some(active) = &mut self.active_download {
+                active.cancellation.cancel();
+                active.status_text = "Cancelling...".to_string();
+            }
+        } else if let Some(job) = self.queue.cancel_pending(id) {
+            let entry = HistoryEntry::unfinished(
+                &job.request,
+                job.platform,
+                job.title,
+                HistoryStatus::Cancelled,
+            );
+            if let Err(error) = self.history.append(entry) {
+                self.notification = Some(format!("Could not update history: {error}"));
+            }
+            self.queue.remove_terminal(id);
+        }
+    }
+
+    fn cancel_all(&mut self) {
         if let Some(active) = &mut self.active_download {
             active.cancellation.cancel();
-            active.status_text = "Cancelling...".to_string();
+            let title = active
+                .item
+                .as_ref()
+                .map_or_else(|| "Download job".to_string(), |item| item.title.clone());
+            let entry = HistoryEntry::unfinished(
+                &active.request,
+                active.platform,
+                title,
+                HistoryStatus::Cancelled,
+            );
+            if let Err(error) = self.history.append(entry) {
+                self.notification = Some(format!("Could not update history: {error}"));
+            }
         }
+        let pending: Vec<_> = self
+            .queue
+            .entries()
+            .filter(|job| job.status == QueueStatus::Pending)
+            .map(|job| job.id)
+            .collect();
+        for id in pending {
+            self.cancel_job(id);
+        }
+    }
+
+    fn retry_history(&mut self, index: usize) {
+        let Some(entry) = self.history.entries().get(index).cloned() else {
+            return;
+        };
+        let Some(request) = entry.retry_request() else {
+            self.notification = Some("Successful history entries cannot be retried".to_string());
+            return;
+        };
+        self.enqueue(request, format!("Retry: {}", entry.title));
+    }
+
+    pub fn active_for(&self, id: JobId) -> Option<&ActiveDownload> {
+        self.active_download
+            .as_ref()
+            .filter(|active| active.job_id == id)
     }
 }
 
@@ -428,6 +626,14 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
                 state.url_input.clear();
                 return Transition::Push(Screen::HowToUse);
             }
+            if input == "/queue" {
+                state.url_input.clear();
+                return Transition::Push(Screen::Queue(QueueState::default()));
+            }
+            if input == "/history" {
+                state.url_input.clear();
+                return Transition::Push(Screen::History(HistoryState::default()));
+            }
             match detect_platform(&input) {
                 Ok(_) => Transition::Push(Screen::Playlist(PlaylistState {
                     url: input,
@@ -509,7 +715,7 @@ fn handle_quality_key(
         KeyCode::Up | KeyCode::Left => move_selection(&mut state.selected, 2, false),
         KeyCode::Down | KeyCode::Right => move_selection(&mut state.selected, 2, true),
         KeyCode::Enter => {
-            shared.start_download(DownloadRequest {
+            let request = DownloadRequest {
                 url: state.url.clone(),
                 format: state.format,
                 quality: if state.selected == 0 {
@@ -518,19 +724,129 @@ fn handle_quality_key(
                     Quality::Compressed
                 },
                 playlist: state.playlist,
-            });
-            return Transition::Replace(Screen::Download(DownloadViewState));
+            };
+            shared.enqueue(request, state.url.clone());
+            return Transition::ReturnToMain { clear_input: true };
         }
         _ => {}
     }
     Transition::Stay
 }
 
-fn handle_download_key(shared: &mut SharedState, key: KeyEvent) -> Transition {
+fn handle_download_key(
+    state: &DownloadViewState,
+    shared: &mut SharedState,
+    key: KeyEvent,
+) -> Transition {
     if key.code == KeyCode::Esc {
-        shared.cancel_active_download();
+        shared.cancel_job(state.job_id);
     }
     Transition::Stay
+}
+
+fn handle_queue_key(state: &mut QueueState, shared: &mut SharedState, key: KeyEvent) -> Transition {
+    let ids: Vec<_> = shared
+        .queue
+        .entries()
+        .filter(|job| matches!(job.status, QueueStatus::Pending | QueueStatus::Running))
+        .map(|job| job.id)
+        .collect();
+    if ids.is_empty() {
+        state.selected = 0;
+    } else {
+        state.selected = state.selected.min(ids.len() - 1);
+    }
+    let selected_id = ids.get(state.selected).copied();
+
+    match key.code {
+        KeyCode::Esc => Transition::Back,
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(id) = selected_id {
+                if shared.queue.move_pending(id, false) {
+                    state.selected = state.selected.saturating_sub(1);
+                }
+            }
+            Transition::Stay
+        }
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(id) = selected_id {
+                if shared.queue.move_pending(id, true) {
+                    state.selected = (state.selected + 1).min(ids.len().saturating_sub(1));
+                }
+            }
+            Transition::Stay
+        }
+        KeyCode::Up => {
+            state.selected = state.selected.saturating_sub(1);
+            Transition::Stay
+        }
+        KeyCode::Down => {
+            if !ids.is_empty() {
+                state.selected = (state.selected + 1).min(ids.len() - 1);
+            }
+            Transition::Stay
+        }
+        KeyCode::Char('d') => {
+            if let Some(id) = selected_id {
+                shared.queue.remove_pending(id);
+            }
+            Transition::Stay
+        }
+        KeyCode::Char('c') => {
+            if let Some(id) = selected_id {
+                shared.cancel_job(id);
+            }
+            Transition::Stay
+        }
+        KeyCode::Enter => selected_id.map_or(Transition::Stay, |job_id| {
+            Transition::Push(Screen::Download(DownloadViewState { job_id }))
+        }),
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_history_key(
+    state: &mut HistoryState,
+    shared: &mut SharedState,
+    key: KeyEvent,
+) -> Transition {
+    let count = shared.history.entries().len();
+    if count == 0 {
+        state.selected = 0;
+    } else {
+        state.selected = state.selected.min(count - 1);
+    }
+    match key.code {
+        KeyCode::Esc => Transition::Back,
+        KeyCode::Up => {
+            state.selected = state.selected.saturating_sub(1);
+            Transition::Stay
+        }
+        KeyCode::Down => {
+            if count > 0 {
+                state.selected = (state.selected + 1).min(count - 1);
+            }
+            Transition::Stay
+        }
+        KeyCode::Char('r') => {
+            if count > 0 {
+                shared.retry_history(count - 1 - state.selected);
+            }
+            Transition::Stay
+        }
+        _ => Transition::Stay,
+    }
+}
+
+fn handle_exit_confirm_key(shared: &mut SharedState, key: KeyEvent) -> Transition {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            shared.cancel_all();
+            Transition::ForceQuit
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Transition::Back,
+        _ => Transition::Stay,
+    }
 }
 
 fn handle_complete_key(key: KeyEvent) -> Transition {
@@ -684,12 +1000,17 @@ mod tests {
     }
 
     fn shared_state(first_run: bool) -> SharedState {
+        let history_dir = tempfile::tempdir().unwrap();
+        let history = HistoryStore::open(history_dir.path().join("history.jsonl"), 10).unwrap();
         SharedState {
             config: Config::default(),
             first_run,
             rclone_available: false,
             spinner_index: 0,
+            queue: DownloadQueue::new(),
+            history,
             active_download: None,
+            notification: None,
             startup_error: None,
         }
     }

@@ -628,6 +628,7 @@ fn error_kind(error: &Error) -> &'static str {
         Error::Io(_) => "io",
         Error::TomlDecode(_) => "toml_decode",
         Error::TomlEncode(_) => "toml_encode",
+        Error::Json(_) => "json",
         Error::MissingTool(_) => "missing_tool",
         Error::ProcessFailed(_) => "process_failed",
         Error::Cancelled => "cancelled",

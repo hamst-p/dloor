@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    ActiveDownload, App, CompleteState, ErrorState, MainState, Screen, SetupField, SetupState,
-    SharedState,
+    ActiveDownload, App, CompleteState, ErrorState, HistoryState, MainState, QueueState, Screen,
+    SetupField, SetupState, SharedState,
 };
 
 const LOGO: &str = r"
@@ -48,14 +48,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App) {
             ],
             state.selected,
         ),
-        Screen::Download(_) => render_download(
+        Screen::Download(state) => render_download(
             frame,
-            app.shared.active_download.as_ref(),
+            app.shared.active_for(state.job_id),
+            app.shared.queue.entry(state.job_id),
             app.shared.spinner_index,
         ),
+        Screen::Queue(state) => render_queue(frame, state, &app.shared),
+        Screen::History(state) => render_history(frame, state, &app.shared),
         Screen::Complete(state) => render_complete(frame, state),
+        Screen::ExitConfirm => render_exit_confirm(frame, &app.shared),
         Screen::Error(state) => render_error(frame, state),
     }
+    render_queue_indicator(frame, &app.shared);
 }
 
 fn base_layout(area: Rect) -> Vec<Rect> {
@@ -229,7 +234,7 @@ fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
         body[7],
     );
     frame.render_widget(
-        Paragraph::new("/howtouse  /settings  /quit")
+        Paragraph::new("/queue  /history  /howtouse  /settings  /quit")
             .alignment(Alignment::Center)
             .fg(Color::DarkGray),
         body[8],
@@ -280,7 +285,12 @@ fn render_choice(frame: &mut Frame<'_>, title: &str, options: &[&str], selected:
     );
 }
 
-fn render_download(frame: &mut Frame<'_>, active: Option<&ActiveDownload>, spinner_index: usize) {
+fn render_download(
+    frame: &mut Frame<'_>,
+    active: Option<&ActiveDownload>,
+    queued: Option<&dloor_core::QueuedJob>,
+    spinner_index: usize,
+) {
     let chunks = base_layout(frame.area());
     render_logo(frame, chunks[0]);
     let area = centered(chunks[1], 84, 17);
@@ -295,10 +305,19 @@ fn render_download(frame: &mut Frame<'_>, active: Option<&ActiveDownload>, spinn
         .split(area);
 
     let platform = active
-        .and_then(|download| download.platform)
+        .map(|download| download.platform)
         .map(|platform| platform.label())
         .unwrap_or("Detecting...");
-    let status_text = active.map_or("Finishing...", |download| download.status_text.as_str());
+    let status_text = active.map_or_else(
+        || {
+            queued.map_or("No longer in queue", |job| match job.status {
+                dloor_core::QueueStatus::Pending => "Waiting in queue",
+                dloor_core::QueueStatus::Running => "Starting...",
+                _ => job.status.label(),
+            })
+        },
+        |download| download.status_text.as_str(),
+    );
     let item_label = active
         .and_then(|download| download.item.as_ref())
         .map_or_else(
@@ -396,6 +415,122 @@ fn render_complete(frame: &mut Frame<'_>, state: &CompleteState) {
     render_footer(frame, chunks[2], "Enter: new download  q: quit");
 }
 
+fn render_queue(frame: &mut Frame<'_>, state: &QueueState, shared: &SharedState) {
+    let chunks = base_layout(frame.area());
+    render_logo(frame, chunks[0]);
+    let jobs: Vec<_> = shared
+        .queue
+        .entries()
+        .filter(|job| {
+            matches!(
+                job.status,
+                dloor_core::QueueStatus::Pending | dloor_core::QueueStatus::Running
+            )
+        })
+        .collect();
+    let items: Vec<_> = jobs
+        .iter()
+        .enumerate()
+        .map(|(index, job)| {
+            let marker = if index == state.selected { "> " } else { "  " };
+            let progress = job.progress.as_ref().map_or_else(String::new, |progress| {
+                format!(" {:>5.1}%", progress.overall_percent)
+            });
+            let style = if index == state.selected {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            ListItem::new(format!(
+                "{marker}#{:<3} {:<8}{progress} {}",
+                job.id.0,
+                job.status.label(),
+                truncate_text(&job.title, 52)
+            ))
+            .style(style)
+        })
+        .collect();
+    let list = if items.is_empty() {
+        List::new(vec![ListItem::new("The queue is empty")])
+    } else {
+        List::new(items)
+    };
+    frame.render_widget(
+        list.block(
+            Block::default()
+                .title("Download queue")
+                .borders(Borders::ALL),
+        ),
+        centered(chunks[1], 92, 16),
+    );
+    render_footer(
+        frame,
+        chunks[2],
+        "↑/↓ select  Ctrl+↑/↓ reorder  Enter monitor  c cancel  d remove  Esc back",
+    );
+}
+
+fn render_history(frame: &mut Frame<'_>, state: &HistoryState, shared: &SharedState) {
+    let chunks = base_layout(frame.area());
+    render_logo(frame, chunks[0]);
+    let entries: Vec<_> = shared.history.entries().iter().rev().collect();
+    let items: Vec<_> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let marker = if index == state.selected { "> " } else { "  " };
+            let style = if index == state.selected {
+                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            };
+            let path = entry.destination_path.as_deref().unwrap_or("-");
+            ListItem::new(format!(
+                "{marker}{:<10} {:<16} {} | {}",
+                entry.status.label(),
+                truncate_text(&entry.recorded_at, 16),
+                truncate_text(&entry.title, 36),
+                truncate_text(path, 42)
+            ))
+            .style(style)
+        })
+        .collect();
+    let list = if items.is_empty() {
+        List::new(vec![ListItem::new("No download history yet")])
+    } else {
+        List::new(items)
+    };
+    frame.render_widget(
+        list.block(Block::default().title("History").borders(Borders::ALL)),
+        centered(chunks[1], 110, 18),
+    );
+    render_footer(
+        frame,
+        chunks[2],
+        "↑/↓ select  r retry failed item  Esc back",
+    );
+}
+
+fn render_exit_confirm(frame: &mut Frame<'_>, shared: &SharedState) {
+    let area = centered(frame.area(), 68, 8);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} job is running and {} are waiting.\n\nCancel unfinished jobs and quit? (y/n)",
+            usize::from(shared.active_download.is_some()),
+            shared.queue.pending_count()
+        ))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .title("Unfinished downloads")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn truncate_text(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let prefix: String = chars.by_ref().take(max_chars).collect();
@@ -414,6 +549,31 @@ fn render_error(frame: &mut Frame<'_>, state: &ErrorState) {
             .block(Block::default().title("Error").borders(Borders::ALL))
             .fg(Color::Red)
             .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+fn render_queue_indicator(frame: &mut Frame<'_>, shared: &SharedState) {
+    let width = 58u16.min(frame.area().width);
+    let area = Rect {
+        x: frame.area().right().saturating_sub(width),
+        y: frame.area().y,
+        width,
+        height: 1.min(frame.area().height),
+    };
+    let running = usize::from(shared.active_download.is_some());
+    let mut text = format!(
+        "Running {running} | Queued {}",
+        shared.queue.pending_count()
+    );
+    if let Some(notification) = &shared.notification {
+        text.push_str(" | ");
+        text.push_str(&truncate_text(notification, 32));
+    }
+    frame.render_widget(
+        Paragraph::new(text)
+            .alignment(Alignment::Right)
+            .fg(Color::DarkGray),
         area,
     );
 }
