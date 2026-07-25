@@ -6,6 +6,8 @@
 
 `dloor` is a Rust TUI multimedia downloader powered by `yt-dlp` and `ffmpeg`. It detects supported social/video URLs automatically and lets you download media as video or audio from a terminal UI.
 
+For content you are authorized to access, dloor can ask `yt-dlp` to read the logged-in session from a supported local browser. dloor stores only the selected browser name in its configuration; it does not copy or save browser cookies itself.
+
 Supported URL families:
 
 - YouTube
@@ -147,6 +149,8 @@ On first launch, choose where downloads should be saved.
 - Local: save files to a local directory
 - Cloud: upload files through an `rclone` remote and remote path
 
+Browser authentication is off by default. Enable it only when a supported URL requires your existing logged-in session.
+
 If you choose cloud storage, configure `rclone` first:
 
 ```bash
@@ -198,6 +202,14 @@ You can reopen the setup screen from inside the app with:
 /settings
 ```
 
+### Browser Authentication
+
+Open `/settings`, set `Browser authentication` to `On`, and select the browser where you are already signed in. Supported choices are Chrome, Firefox, Safari, Edge, Brave, Chromium, Vivaldi, and Opera.
+
+dloor then passes the selected browser to `yt-dlp --cookies-from-browser` for each download. The browser profile must be accessible to the current OS user. On macOS, the terminal may ask for Keychain access. Some Chromium-based browsers may need to be fully closed while cookies are read.
+
+Use this only for content you own or are explicitly authorized to download. This feature does not bypass DRM, paywalls, account permissions, or other access controls.
+
 ## Troubleshooting
 
 ### `dloor: command not found`
@@ -233,6 +245,14 @@ yt-dlp -U
 ```
 
 If that does not work, verify that the URL is public and that you have permission to download it.
+
+### Browser Authentication Fails
+
+- Confirm that you are signed in to the selected site in the selected browser.
+- Try closing the browser before starting the download.
+- Allow terminal access if macOS prompts for Keychain permission.
+- Run `yt-dlp --cookies-from-browser chrome "URL"` directly to inspect the full upstream error, replacing `chrome` with your selected browser.
+- Disable browser authentication again in `/settings` when downloading public content.
 
 ## Development
 

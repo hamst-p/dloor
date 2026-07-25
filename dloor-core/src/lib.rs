@@ -9,7 +9,7 @@ pub mod deps;
 pub mod download;
 pub mod platform;
 
-pub use config::{Config, Destination};
+pub use config::{Browser, Config, Destination};
 pub use deps::{check_dependencies, DependencyReport, Tool};
 pub use download::{
     parse_progress_line, DownloadEvent, DownloadJob, DownloadProgress, DownloadRequest, Format,

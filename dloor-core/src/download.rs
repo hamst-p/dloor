@@ -14,7 +14,7 @@ use tokio::{
 use tracing::debug;
 
 use crate::{
-    config::{Config, Destination},
+    config::{Browser, Config, Destination},
     detect_platform, Error, Platform, Result,
 };
 
@@ -122,7 +122,12 @@ impl DownloadJob {
         };
 
         let completed_path = match &self.config.destination {
-            Destination::Local { .. } => final_local.to_string_lossy().to_string(),
+            Destination::Local { path } => {
+                fs::create_dir_all(path).await?;
+                let destination = unique_destination(path, &final_local).await?;
+                move_file(&final_local, &destination).await?;
+                destination.to_string_lossy().to_string()
+            }
             Destination::Cloud { remote, path } => {
                 tx.send(DownloadEvent::Uploading).await.ok();
                 upload_to_cloud(&final_local, remote, path).await?;
@@ -143,21 +148,11 @@ impl DownloadJob {
         Ok(())
     }
 
-    async fn prepare_work_dir(&self) -> Result<(PathBuf, Option<TempDir>)> {
-        match &self.config.destination {
-            Destination::Local { path } if self.request.quality != Quality::Compressed => {
-                fs::create_dir_all(path).await?;
-                Ok((path.clone(), None))
-            }
-            Destination::Local { path } => {
-                fs::create_dir_all(path).await?;
-                Ok((path.clone(), None))
-            }
-            Destination::Cloud { .. } => {
-                let dir = tempfile::Builder::new().prefix("dloor-").tempdir()?;
-                Ok((dir.path().to_path_buf(), Some(dir)))
-            }
-        }
+    async fn prepare_work_dir(&self) -> Result<(PathBuf, TempDir)> {
+        // Always download into a temp dir so existing files at the destination
+        // never collide with yt-dlp or ffmpeg output.
+        let dir = tempfile::Builder::new().prefix("dloor-").tempdir()?;
+        Ok((dir.path().to_path_buf(), dir))
     }
 
     async fn run_ytdlp(
@@ -166,7 +161,7 @@ impl DownloadJob {
         platform: Platform,
         tx: &mpsc::Sender<DownloadEvent>,
     ) -> Result<()> {
-        let mut args = base_ytdlp_args(output_template);
+        let mut args = base_ytdlp_args(output_template, self.config.browser);
         args.extend(format_args(self.request.format, self.request.quality));
         args.push(OsString::from(&self.request.url));
 
@@ -217,14 +212,19 @@ impl DownloadJob {
     }
 }
 
-fn base_ytdlp_args(output_template: &Path) -> Vec<OsString> {
-    vec![
+fn base_ytdlp_args(output_template: &Path, browser: Option<Browser>) -> Vec<OsString> {
+    let mut args = vec![
         "--newline".into(),
         "--progress-template".into(),
         "%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s".into(),
         "-o".into(),
         output_template.as_os_str().to_os_string(),
-    ]
+    ];
+    if let Some(browser) = browser {
+        args.push("--cookies-from-browser".into());
+        args.push(browser.yt_dlp_name().into());
+    }
+    args
 }
 
 fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
@@ -301,6 +301,44 @@ async fn newest_file(dir: &Path, after: SystemTime) -> Result<PathBuf> {
     newest.map(|(path, _)| path).ok_or(Error::MissingOutputFile)
 }
 
+async fn unique_destination(dir: &Path, source: &Path) -> Result<PathBuf> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| Error::InvalidPath(source.display().to_string()))?;
+    let candidate = dir.join(file_name);
+    if !fs::try_exists(&candidate).await? {
+        return Ok(candidate);
+    }
+
+    let stem = source
+        .file_stem()
+        .ok_or_else(|| Error::InvalidPath(source.display().to_string()))?
+        .to_string_lossy();
+    let extension = source.extension().map(|ext| ext.to_string_lossy());
+
+    for counter in 1..=10_000u32 {
+        let candidate = match &extension {
+            Some(ext) => dir.join(format!("{stem} ({counter}).{ext}")),
+            None => dir.join(format!("{stem} ({counter})")),
+        };
+        if !fs::try_exists(&candidate).await? {
+            return Ok(candidate);
+        }
+    }
+
+    Err(Error::InvalidPath(candidate.display().to_string()))
+}
+
+async fn move_file(from: &Path, to: &Path) -> Result<()> {
+    if fs::rename(from, to).await.is_ok() {
+        return Ok(());
+    }
+    // rename fails across filesystems (temp dir vs destination), so copy + remove instead
+    fs::copy(from, to).await?;
+    fs::remove_file(from).await?;
+    Ok(())
+}
+
 async fn transcode_video(input: &Path) -> Result<PathBuf> {
     let stem = input
         .file_stem()
@@ -365,5 +403,29 @@ mod tests {
     #[test]
     fn ignores_non_progress_lines() {
         assert!(parse_progress_line("[download] Destination: file.mp4").is_none());
+    }
+
+    #[test]
+    fn browser_cookie_args_are_only_added_when_enabled() {
+        let output = Path::new("video.%(ext)s");
+        let without_auth = base_ytdlp_args(output, None);
+        assert!(!without_auth.contains(&OsString::from("--cookies-from-browser")));
+
+        let with_auth = base_ytdlp_args(output, Some(Browser::Firefox));
+        assert!(with_auth
+            .windows(2)
+            .any(|args| args == ["--cookies-from-browser", "firefox"]));
+    }
+
+    #[tokio::test]
+    async fn unique_destination_appends_counter_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("video.mp4"), b"").await.unwrap();
+
+        let destination = unique_destination(dir.path(), Path::new("video.mp4"))
+            .await
+            .unwrap();
+
+        assert_eq!(destination, dir.path().join("video (1).mp4"));
     }
 }

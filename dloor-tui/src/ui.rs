@@ -107,11 +107,33 @@ fn render_setup(frame: &mut Frame<'_>, app: &App) {
         ));
     }
 
+    lines.push(Line::from(""));
+    lines.push(field_line(
+        "Browser authentication",
+        if app.setup.use_browser_cookies {
+            "On"
+        } else {
+            "Off"
+        },
+        app.setup.field == SetupField::BrowserAuthentication,
+    ));
+    if app.setup.use_browser_cookies {
+        lines.push(field_line(
+            "Browser",
+            dloor_core::Browser::ALL[app.setup.browser_index].label(),
+            app.setup.field == SetupField::Browser,
+        ));
+        lines.push(Line::from(Span::styled(
+            "Uses the selected browser's logged-in session; cookies are not copied by dloor",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+
     frame.render_widget(
         Paragraph::new(lines)
             .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false }),
-        centered(chunks[1], 74, 12),
+        centered(chunks[1], 82, 16),
     );
     render_footer(frame, chunks[2], "Tab: next field  Enter: save  Esc: back");
 }
@@ -129,11 +151,12 @@ fn field_line(label: &str, value: &str, selected: bool) -> Line<'static> {
 }
 
 fn render_main(frame: &mut Frame<'_>, app: &App) {
-    let area = centered(frame.area(), 86, 20);
+    let area = centered(frame.area(), 86, 21);
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -170,15 +193,21 @@ fn render_main(frame: &mut Frame<'_>, app: &App) {
         body[5],
     );
     frame.render_widget(
+        Paragraph::new(app.authentication_label())
+            .alignment(Alignment::Center)
+            .fg(Color::DarkGray),
+        body[6],
+    );
+    frame.render_widget(
         Paragraph::new(app.url_input.as_str())
             .block(Block::default().title("Input URL").borders(Borders::ALL)),
-        body[6],
+        body[7],
     );
     frame.render_widget(
         Paragraph::new("/howtouse  /settings  /quit")
             .alignment(Alignment::Center)
             .fg(Color::DarkGray),
-        body[7],
+        body[8],
     );
     render_footer(frame, footer_area(frame.area()), "Paste URL, then Enter");
 }

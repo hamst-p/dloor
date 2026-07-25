@@ -1,8 +1,9 @@
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use dloor_core::{
-    check_dependencies, config::default_download_dir, detect_platform, Config, Destination,
-    DownloadEvent, DownloadJob, DownloadProgress, DownloadRequest, Format, Platform, Quality,
+    check_dependencies, config::default_download_dir, detect_platform, Browser, Config,
+    Destination, DownloadEvent, DownloadJob, DownloadProgress, DownloadRequest, Format, Platform,
+    Quality,
 };
 use tokio::sync::mpsc;
 
@@ -30,6 +31,8 @@ pub enum SetupField {
     LocalPath,
     Remote,
     RemotePath,
+    BrowserAuthentication,
+    Browser,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,8 @@ pub struct SetupState {
     pub local_path: String,
     pub remote: String,
     pub remote_path: String,
+    pub use_browser_cookies: bool,
+    pub browser_index: usize,
     pub rclone_available: bool,
 }
 
@@ -152,6 +157,18 @@ impl App {
             KeyCode::BackTab | KeyCode::Up => self.prev_setup_field(),
             KeyCode::Left | KeyCode::Right if self.setup.field == SetupField::Destination => {
                 self.setup.cloud = !self.setup.cloud && self.setup.rclone_available;
+            }
+            KeyCode::Left | KeyCode::Right
+                if self.setup.field == SetupField::BrowserAuthentication =>
+            {
+                self.setup.use_browser_cookies = !self.setup.use_browser_cookies;
+            }
+            KeyCode::Left if self.setup.field == SetupField::Browser => {
+                self.setup.browser_index =
+                    (self.setup.browser_index + Browser::ALL.len() - 1) % Browser::ALL.len();
+            }
+            KeyCode::Right if self.setup.field == SetupField::Browser => {
+                self.setup.browser_index = (self.setup.browser_index + 1) % Browser::ALL.len();
             }
             KeyCode::Enter => {
                 if let Err(error) = self.save_setup() {
@@ -327,6 +344,10 @@ impl App {
             }
         };
         self.config.destination = destination;
+        self.config.browser = self
+            .setup
+            .use_browser_cookies
+            .then(|| Browser::ALL[self.setup.browser_index]);
         self.config.save()?;
         self.first_run = false;
         self.screen = Screen::Main;
@@ -345,23 +366,45 @@ impl App {
         }
     }
 
+    pub fn authentication_label(&self) -> String {
+        self.config.browser.map_or_else(
+            || "auth: public content only".to_string(),
+            |browser| format!("auth: {} browser session", browser.label()),
+        )
+    }
+
     fn next_setup_field(&mut self) {
-        self.setup.field = match (self.setup.field, self.setup.cloud) {
-            (SetupField::Destination, false) => SetupField::LocalPath,
-            (SetupField::Destination, true) => SetupField::Remote,
-            (SetupField::LocalPath, _) => SetupField::Destination,
-            (SetupField::Remote, _) => SetupField::RemotePath,
-            (SetupField::RemotePath, _) => SetupField::Destination,
+        self.setup.field = match (
+            self.setup.field,
+            self.setup.cloud,
+            self.setup.use_browser_cookies,
+        ) {
+            (SetupField::Destination, false, _) => SetupField::LocalPath,
+            (SetupField::Destination, true, _) => SetupField::Remote,
+            (SetupField::LocalPath, _, _) => SetupField::BrowserAuthentication,
+            (SetupField::Remote, _, _) => SetupField::RemotePath,
+            (SetupField::RemotePath, _, _) => SetupField::BrowserAuthentication,
+            (SetupField::BrowserAuthentication, _, true) => SetupField::Browser,
+            (SetupField::BrowserAuthentication, _, false) => SetupField::Destination,
+            (SetupField::Browser, _, _) => SetupField::Destination,
         };
     }
 
     fn prev_setup_field(&mut self) {
-        self.setup.field = match (self.setup.field, self.setup.cloud) {
-            (SetupField::Destination, false) => SetupField::LocalPath,
-            (SetupField::Destination, true) => SetupField::RemotePath,
-            (SetupField::LocalPath, _) => SetupField::Destination,
-            (SetupField::Remote, _) => SetupField::Destination,
-            (SetupField::RemotePath, _) => SetupField::Remote,
+        self.setup.field = match (
+            self.setup.field,
+            self.setup.cloud,
+            self.setup.use_browser_cookies,
+        ) {
+            (SetupField::Destination, _, true) => SetupField::Browser,
+            (SetupField::Destination, false, false) => SetupField::BrowserAuthentication,
+            (SetupField::Destination, true, false) => SetupField::BrowserAuthentication,
+            (SetupField::LocalPath, _, _) => SetupField::Destination,
+            (SetupField::Remote, _, _) => SetupField::Destination,
+            (SetupField::RemotePath, _, _) => SetupField::Remote,
+            (SetupField::BrowserAuthentication, false, _) => SetupField::LocalPath,
+            (SetupField::BrowserAuthentication, true, _) => SetupField::RemotePath,
+            (SetupField::Browser, _, _) => SetupField::BrowserAuthentication,
         };
     }
 
@@ -370,7 +413,7 @@ impl App {
             SetupField::LocalPath => self.setup.local_path.push(ch),
             SetupField::Remote => self.setup.remote.push(ch),
             SetupField::RemotePath => self.setup.remote_path.push(ch),
-            SetupField::Destination => {}
+            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
         }
     }
 
@@ -385,13 +428,17 @@ impl App {
             SetupField::RemotePath => {
                 self.setup.remote_path.pop();
             }
-            SetupField::Destination => {}
+            SetupField::Destination | SetupField::BrowserAuthentication | SetupField::Browser => {}
         }
     }
 }
 
 impl SetupState {
     fn from_config(config: &Config, rclone_available: bool) -> Self {
+        let browser_index = config
+            .browser
+            .and_then(|selected| Browser::ALL.iter().position(|browser| *browser == selected))
+            .unwrap_or(0);
         match &config.destination {
             Destination::Local { path } => Self {
                 cloud: false,
@@ -399,6 +446,8 @@ impl SetupState {
                 local_path: path.to_string_lossy().to_string(),
                 remote: "gdrive".to_string(),
                 remote_path: "dloor".to_string(),
+                use_browser_cookies: config.browser.is_some(),
+                browser_index,
                 rclone_available,
             },
             Destination::Cloud { remote, path } => Self {
@@ -407,6 +456,8 @@ impl SetupState {
                 local_path: default_download_dir().to_string_lossy().to_string(),
                 remote: remote.clone(),
                 remote_path: path.clone(),
+                use_browser_cookies: config.browser.is_some(),
+                browser_index,
                 rclone_available,
             },
         }
