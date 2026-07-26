@@ -1,10 +1,14 @@
 # dloor
 
+[![CI](https://github.com/hamst-p/dloor/actions/workflows/ci.yml/badge.svg)](https://github.com/hamst-p/dloor/actions/workflows/ci.yml)
+
 > Educational purpose only.
 >
 > dloor is intended for learning, personal tooling experiments, and lawful personal archiving. Use it only with content you own, content in the public domain, or content you have explicit permission to download. You are responsible for complying with copyright law, platform terms of service, and any other rules that apply in your jurisdiction. This project does not encourage or support infringement, redistribution of copyrighted material, bypassing access controls, or downloading private content without authorization.
 
-`dloor` is a Rust TUI multimedia downloader powered by `yt-dlp` and `ffmpeg`. It detects supported social/video URLs automatically and lets you download media as video or audio from a terminal UI.
+`dloor` is a Rust multimedia downloader powered by `yt-dlp` and `ffmpeg`. It
+provides both a Ratatui terminal UI (`dloor`) and a non-interactive,
+pipe-friendly command (`dloor-cli`).
 
 For content you are authorized to access, dloor can ask `yt-dlp` to read the
 logged-in session from a supported local browser or use a Netscape-format cookie
@@ -48,6 +52,9 @@ dloor is early-stage OSS software. The local download flow is the primary suppor
   a completion warning
 - Select 720p, 1080p, 1440p, or 2160p video bounds when available
 - Apply an optional validated yt-dlp bandwidth limit
+- Run scripted or batch downloads through the non-interactive `dloor-cli`
+- Publish completed local files without overwriting existing names or exposing
+  partially copied final files
 - Save locally or upload through an optional `rclone` remote
 
 ## Quick Start
@@ -74,7 +81,9 @@ Install the `dloor` command locally:
 
 ```bash
 cargo install --path dloor-tui --force
+cargo install --path dloor-cli --force
 dloor
+dloor-cli --help
 ```
 
 ## Installation Options
@@ -107,9 +116,11 @@ If Rust is already installed, you can install directly from the repository:
 cargo install --git https://github.com/hamst-p/dloor.git --package dloor-tui --bin dloor
 cargo install --git https://github.com/hamst-p/dloor.git --package dloor-cli --bin dloor-cli
 dloor
+dloor-cli --help
 ```
 
-The executable is usually installed at `~/.cargo/bin/dloor`. If your shell cannot find `dloor`, make sure `~/.cargo/bin` is included in your `PATH`.
+The executables are usually installed under `~/.cargo/bin`. If your shell
+cannot find them, make sure that directory is included in your `PATH`.
 
 ### Build From Source
 
@@ -258,6 +269,43 @@ failure, `2` for invalid arguments, and `130` after Ctrl-C has cancelled the
 active child process. Individual URL failures do not prevent later URLs from
 running.
 
+Common options:
+
+- `--format video|audio`: select the output media type; defaults to `video`
+- `--quality best|compressed|720p|1080p|1440p|2160p`: override
+  `default_quality`
+- `--output <DIR>`: required local destination
+- `--playlist`: expand each supplied playlist instead of selecting one item
+- `--allow-generic`: explicitly permit a syntactically valid, unverified host
+- `--config <FILE>`: use an explicit configuration file
+- `--no-config`: ignore saved configuration and use built-in defaults
+- `--json`: emit one JSON document with `schema_version: 1`
+
+For example, process multiple authorized URLs and keep stdout machine-readable:
+
+```bash
+dloor-cli \
+  --no-config \
+  --json \
+  --output "$HOME/Downloads" \
+  "https://www.youtube.com/watch?v=EXAMPLE_1" \
+  "https://www.youtube.com/watch?v=EXAMPLE_2"
+```
+
+### Local Output Safety
+
+Local downloads and post-processing run in an isolated temporary directory.
+Only the confirmed output is published to the selected destination. If a file
+name already exists, dloor preserves it and appends a numeric suffix such as
+`video (1).mp4`.
+
+When the temporary directory and destination are on different filesystems,
+dloor copies into a temporary file inside the destination, synchronizes it, and
+then publishes it without replacing an existing name. Cancelling before
+publication removes temporary work; once publication succeeds, the item is
+reported as completed rather than retroactively cancelled. Subtitle sidecars
+follow the same publication rules.
+
 ## Key Commands
 
 - URL input: paste a URL and press `Enter`
@@ -342,10 +390,11 @@ audio_bitrate_kbps = 128
 The defaults above preserve the original output. `crf` must be between 0 and
 51, `max_width` must be an even value from 16 through 1920, and
 `audio_bitrate_kbps` must be from 8 through 512. `preset` is restricted to the
-known x264 preset names. Arbitrary codec names, filter expressions, and extra
-ffmpeg arguments are deliberately not accepted. Existing configurations that
-omit `[transcode]`, as well as partially specified presets, receive the current
-defaults for every missing value.
+known x264 values `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`,
+`medium`, `slow`, `slower`, `veryslow`, and `placebo`. Arbitrary codec names,
+filter expressions, and extra ffmpeg arguments are deliberately not accepted.
+Existing configurations that omit `[transcode]`, as well as partially specified
+presets, receive the current defaults for every missing value.
 
 An optional `bandwidth_limit` accepts positive byte rates such as `"50K"`,
 `"4.2M"`, `"1G"`, or an integer byte count:
