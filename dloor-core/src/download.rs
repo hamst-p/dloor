@@ -139,6 +139,7 @@ pub enum DownloadWarningKind {
     SubtitleSidecar,
     OptionalPostProcessing,
     ResolutionFallback,
+    CookieFallback,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,6 +226,14 @@ struct YtdlpOutput {
     warnings: Vec<DownloadWarning>,
 }
 
+#[derive(Debug)]
+struct YtdlpAttempt {
+    status: std::process::ExitStatus,
+    output_path: Option<PathBuf>,
+    selected_height: Option<u64>,
+    stderr: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DownloadTarget {
     NoPlaylist,
@@ -244,6 +253,8 @@ pub struct DownloadJob {
     pub request: DownloadRequest,
     pub config: Config,
     cancellation: CancellationToken,
+    #[cfg(test)]
+    yt_dlp_program: PathBuf,
 }
 
 impl DownloadJob {
@@ -252,6 +263,8 @@ impl DownloadJob {
             request,
             config,
             cancellation: CancellationToken::new(),
+            #[cfg(test)]
+            yt_dlp_program: PathBuf::from("yt-dlp"),
         }
     }
 
@@ -370,7 +383,8 @@ impl DownloadJob {
         self.ensure_not_cancelled()?;
 
         let sidecars = if self.config.media.write_subtitles {
-            collect_subtitle_sidecars(&work_dir, &final_local).await?
+            let media_dir = final_local.parent().unwrap_or(&work_dir);
+            collect_subtitle_sidecars(media_dir, &final_local).await?
         } else {
             Vec::new()
         };
@@ -438,6 +452,17 @@ impl DownloadJob {
         }
     }
 
+    fn yt_dlp_command(&self) -> Command {
+        #[cfg(test)]
+        {
+            Command::new(&self.yt_dlp_program)
+        }
+        #[cfg(not(test))]
+        {
+            Command::new("yt-dlp")
+        }
+    }
+
     async fn prepare_work_dir(&self) -> Result<(PathBuf, TempDir)> {
         // Always download into a temp dir so existing files at the destination
         // never collide with yt-dlp or ffmpeg output.
@@ -454,30 +479,114 @@ impl DownloadJob {
         platform: Platform,
         tx: &mpsc::Sender<DownloadEvent>,
     ) -> Result<YtdlpOutput> {
-        let mut args = base_ytdlp_args(output_template, &self.config.cookies);
-        args.extend(format_args(self.request.format, self.request.quality));
-        args.extend(bandwidth_args(self.config.bandwidth_limit.as_ref()));
         let (optional_args, mut warnings) = media_args(
             &self.config.media,
             self.request.format,
             self.request.quality,
             &item,
         );
-        args.extend(optional_args);
+        let mut effective_cookies = self.config.cookies.clone();
+        let mut configured_attempt_failure = None;
+        let mut attempt = self
+            .run_ytdlp_attempt(
+                output_template,
+                target,
+                &item,
+                processed_items,
+                platform,
+                tx,
+                &effective_cookies,
+                false,
+                &optional_args,
+            )
+            .await?;
+
+        if !attempt.status.success()
+            && attempt.output_path.is_none()
+            && should_retry_without_cookies(platform, &effective_cookies, &attempt.stderr)
+        {
+            self.ensure_not_cancelled()?;
+            let fallback_output_template =
+                prepare_cookie_fallback_output_template(output_template).await?;
+            configured_attempt_failure = Some(ytdlp_process_error_message(
+                &attempt.status,
+                &attempt.stderr,
+                &effective_cookies,
+            ));
+            debug!("retrying rejected YouTube media request without cookies");
+            effective_cookies = CookieSource::None;
+            attempt = self
+                .run_ytdlp_attempt(
+                    &fallback_output_template,
+                    target,
+                    &item,
+                    processed_items,
+                    platform,
+                    tx,
+                    &effective_cookies,
+                    true,
+                    &optional_args,
+                )
+                .await?;
+            warnings.push(DownloadWarning {
+                item: item.clone(),
+                kind: DownloadWarningKind::CookieFallback,
+                message: "A cookie-backed media request was rejected with HTTP 403; dloor completed this public item without cookies.".to_string(),
+            });
+        }
+
+        let result = self
+            .finish_ytdlp_attempt(attempt, &effective_cookies, warnings, &item)
+            .await;
+        match (result, configured_attempt_failure) {
+            (Err(Error::ProcessFailed(public_error)), Some(configured_error)) => {
+                Err(Error::ProcessFailed(format!(
+                    "Configured session attempt failed: {configured_error}\nPublic fallback failed: {public_error}"
+                )))
+            }
+            (result, _) => result,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_ytdlp_attempt(
+        &self,
+        output_template: &Path,
+        target: DownloadTarget,
+        item: &DownloadItem,
+        processed_items: usize,
+        platform: Platform,
+        tx: &mpsc::Sender<DownloadEvent>,
+        cookies: &CookieSource,
+        explicitly_disable_cookies: bool,
+        optional_args: &[OsString],
+    ) -> Result<YtdlpAttempt> {
+        let mut args = base_ytdlp_args(output_template, cookies);
+        if explicitly_disable_cookies {
+            args.extend(explicit_no_cookie_args());
+        }
+        args.extend(format_args(self.request.format, self.request.quality));
+        args.extend(bandwidth_args(self.config.bandwidth_limit.as_ref()));
+        args.extend(optional_args.iter().cloned());
         args.extend(download_target_args(target));
         args.push(OsString::from(&self.request.url));
 
         debug!(
             format = ?self.request.format,
             quality = ?self.request.quality,
-            cookie_source = match self.config.cookies {
-                CookieSource::None => "none",
-                CookieSource::Browser { .. } => "browser",
-                CookieSource::File { .. } => "file",
+            cookie_source = if explicitly_disable_cookies {
+                "disabled"
+            } else {
+                match cookies {
+                    CookieSource::None => "none",
+                    CookieSource::Browser { .. } => "browser",
+                    CookieSource::File { .. } => "file",
+                }
             },
             "spawning yt-dlp"
         );
-        let mut child = Command::new("yt-dlp")
+        let mut child = self
+            .yt_dlp_command()
             .args(args)
             .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
@@ -515,11 +624,18 @@ impl DownloadJob {
                                 output_path = Some(path);
                             } else if let Some(height) = parse_height_line(&line) {
                                 selected_height = Some(height);
-                            } else {
-                                // before_dl planning records share stdout with the
-                                // after_move record, but are unambiguously prefixed.
-                                // Actual progress records are read only from stderr.
-                                progress_tracker.update(&line);
+                            } else if let Some(progress) = progress_tracker.update(&line) {
+                                // yt-dlp may emit progress on stdout when
+                                // machine-readable --print records are active.
+                                let progress =
+                                    with_overall_progress(progress, processed_items, item.total);
+                                tx.send(DownloadEvent::Progress {
+                                    progress,
+                                    item: item.clone(),
+                                    platform,
+                                })
+                                .await
+                                .ok();
                             }
                         }
                         None => stdout_open = false,
@@ -558,8 +674,31 @@ impl DownloadJob {
             }
             status = child.wait() => status?,
         };
-        let stderr = stderr_messages.join("\n");
-        warnings.extend(postprocessing_warnings(&stderr, &self.config.media, &item));
+
+        Ok(YtdlpAttempt {
+            status,
+            output_path,
+            selected_height,
+            stderr: stderr_messages.join("\n"),
+        })
+    }
+
+    async fn finish_ytdlp_attempt(
+        &self,
+        attempt: YtdlpAttempt,
+        cookies: &CookieSource,
+        mut warnings: Vec<DownloadWarning>,
+        item: &DownloadItem,
+    ) -> Result<YtdlpOutput> {
+        let YtdlpAttempt {
+            status,
+            output_path,
+            selected_height,
+            stderr,
+        } = attempt;
+        let postprocessing_warnings = postprocessing_warnings(&stderr, &self.config.media, item);
+        let has_recoverable_postprocessing_failure = !postprocessing_warnings.is_empty();
+        warnings.extend(postprocessing_warnings);
         if let (Some(requested), Some(actual)) = (self.request.quality.height(), selected_height) {
             if actual != u64::from(requested) {
                 warnings.push(DownloadWarning {
@@ -572,24 +711,23 @@ impl DownloadJob {
             }
         }
         deduplicate_warnings(&mut warnings);
+
+        if !status.success() && output_path.is_none() {
+            return Err(ytdlp_process_error(&status, &stderr, cookies));
+        }
         let output_path = output_path.ok_or(Error::MissingOutputFile)?;
         let output_is_valid = output_path.extension().is_none_or(|ext| ext != "part")
             && fs::metadata(&output_path)
                 .await
                 .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0);
         if !status.success() {
-            if output_is_valid && !warnings.is_empty() {
+            if output_is_valid && has_recoverable_postprocessing_failure {
                 return Ok(YtdlpOutput {
                     path: output_path,
                     warnings,
                 });
             }
-            let message = if stderr.trim().is_empty() {
-                format!("yt-dlp exited with {status}")
-            } else {
-                sanitized_ytdlp_error(&stderr, &self.config.cookies)
-            };
-            return Err(Error::ProcessFailed(message));
+            return Err(ytdlp_process_error(&status, &stderr, cookies));
         }
         if !output_is_valid {
             return Err(Error::MissingOutputFile);
@@ -645,7 +783,7 @@ impl DownloadJob {
         selection_args: &[&str],
         default_target: DownloadTarget,
     ) -> Result<Vec<ResolvedItem>> {
-        let mut command = Command::new("yt-dlp");
+        let mut command = self.yt_dlp_command();
         command.args([
             "--flat-playlist",
             "--dump-json",
@@ -805,6 +943,55 @@ fn error_kind(error: &Error) -> &'static str {
     }
 }
 
+fn should_retry_without_cookies(platform: Platform, cookies: &CookieSource, stderr: &str) -> bool {
+    let normalized = stderr.to_ascii_lowercase();
+    matches!(platform, Platform::YouTube | Platform::YouTubeShorts)
+        && !matches!(cookies, CookieSource::None)
+        && normalized.lines().any(|line| {
+            line.contains("unable to download video data") && line.contains("http error 403")
+        })
+}
+
+fn explicit_no_cookie_args() -> [OsString; 2] {
+    [
+        OsString::from("--no-cookies"),
+        OsString::from("--no-cookies-from-browser"),
+    ]
+}
+
+async fn prepare_cookie_fallback_output_template(output_template: &Path) -> Result<PathBuf> {
+    let parent = output_template
+        .parent()
+        .ok_or_else(|| Error::InvalidPath(output_template.display().to_string()))?;
+    let file_name = output_template
+        .file_name()
+        .ok_or_else(|| Error::InvalidPath(output_template.display().to_string()))?;
+    let fallback_dir = parent.join(".dloor-public-retry");
+    fs::create_dir_all(&fallback_dir).await?;
+    Ok(fallback_dir.join(file_name))
+}
+
+fn ytdlp_process_error(
+    status: &std::process::ExitStatus,
+    stderr: &str,
+    cookies: &CookieSource,
+) -> Error {
+    Error::ProcessFailed(ytdlp_process_error_message(status, stderr, cookies))
+}
+
+fn ytdlp_process_error_message(
+    status: &std::process::ExitStatus,
+    stderr: &str,
+    cookies: &CookieSource,
+) -> String {
+    let message = if stderr.trim().is_empty() {
+        format!("yt-dlp exited with {status}")
+    } else {
+        sanitized_ytdlp_error(stderr, cookies)
+    };
+    message
+}
+
 const OUTPUT_PREFIX: &str = "DLOOR_OUTPUT|";
 const HEIGHT_PREFIX: &str = "DLOOR_HEIGHT|";
 const PLAN_PREFIX: &str = "DLOOR_PLAN|";
@@ -849,8 +1036,16 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
     match (format, quality) {
         (Format::Video, Quality::Best) => vec![
             "-f".into(),
-            "bestvideo*+bestaudio/best".into(),
+            concat!(
+                "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/",
+                "best[vcodec^=avc1][acodec^=mp4a]/",
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/",
+                "bestvideo*+bestaudio/best"
+            )
+            .into(),
             "--merge-output-format".into(),
+            "mp4".into(),
+            "--remux-video".into(),
             "mp4".into(),
         ],
         (Format::Video, Quality::Compressed) => vec![
@@ -883,9 +1078,17 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
                 .expect("remaining video quality variants have a height");
             vec![
                 "-f".into(),
-                format!("bestvideo*[height<={height}]+bestaudio/best[height<={height}]/best")
-                    .into(),
+                format!(
+                    "bestvideo[vcodec^=avc1][height<={height}]+bestaudio[acodec^=mp4a]/\
+                     best[vcodec^=avc1][acodec^=mp4a][height<={height}]/\
+                     bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/\
+                     best[ext=mp4][height<={height}]/\
+                     bestvideo*[height<={height}]+bestaudio/best[height<={height}]"
+                )
+                .into(),
                 "--merge-output-format".into(),
+                "mp4".into(),
+                "--remux-video".into(),
                 "mp4".into(),
             ]
         }
@@ -1562,9 +1765,43 @@ async fn wait_for_process(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use std::{io::Write, os::unix::fs::PermissionsExt};
 
     use super::*;
+
+    async fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).await.unwrap();
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn youtube_test_job(program: PathBuf, cookies: CookieSource) -> DownloadJob {
+        let config = Config {
+            cookies,
+            ..Config::default()
+        };
+        let mut job = DownloadJob::new(
+            DownloadRequest {
+                url: "https://www.youtube.com/watch?v=example".to_string(),
+                format: Format::Video,
+                quality: Quality::Best,
+                playlist: PlaylistSelection::Single,
+            },
+            config,
+        );
+        job.yt_dlp_program = program;
+        job
+    }
+
+    fn single_test_item() -> DownloadItem {
+        DownloadItem {
+            index: 1,
+            total: 1,
+            title: "Example".to_string(),
+            playlist_index: None,
+        }
+    }
 
     #[test]
     fn parses_progress_template_output() {
@@ -1744,6 +1981,242 @@ mod tests {
         assert!(with_auth
             .windows(2)
             .any(|args| args == ["--cookies-from-browser", "firefox"]));
+    }
+
+    #[test]
+    fn authenticated_youtube_media_403_retries_without_cookies() {
+        let error = "ERROR: unable to download video data: HTTP Error 403: Forbidden";
+        let browser = CookieSource::Browser {
+            browser: crate::Browser::Firefox,
+        };
+        let file = CookieSource::File {
+            path: PathBuf::from("/tmp/cookies.txt"),
+        };
+
+        assert!(should_retry_without_cookies(
+            Platform::YouTube,
+            &browser,
+            error
+        ));
+        assert!(should_retry_without_cookies(
+            Platform::YouTubeShorts,
+            &file,
+            error
+        ));
+    }
+
+    #[test]
+    fn cookie_fallback_is_limited_to_authenticated_youtube_media_403() {
+        let media_403 = "ERROR: unable to download video data: HTTP Error 403: Forbidden";
+        let browser = CookieSource::Browser {
+            browser: crate::Browser::Firefox,
+        };
+
+        assert!(!should_retry_without_cookies(
+            Platform::YouTube,
+            &CookieSource::None,
+            media_403
+        ));
+        assert!(!should_retry_without_cookies(
+            Platform::Instagram,
+            &browser,
+            media_403
+        ));
+        assert!(!should_retry_without_cookies(
+            Platform::YouTube,
+            &browser,
+            "ERROR: unable to download video data: HTTP Error 404: Not Found"
+        ));
+        assert!(!should_retry_without_cookies(
+            Platform::YouTube,
+            &browser,
+            "ERROR: unable to download webpage: HTTP Error 403: Forbidden"
+        ));
+        assert!(!should_retry_without_cookies(
+            Platform::YouTube,
+            &browser,
+            "ERROR: unable to download video data: HTTP Error 404: Not Found\nERROR: unable to download webpage: HTTP Error 403: Forbidden"
+        ));
+    }
+
+    #[test]
+    fn cookie_fallback_overrides_external_ytdlp_cookie_configuration() {
+        assert_eq!(
+            explicit_no_cookie_args(),
+            [
+                OsString::from("--no-cookies"),
+                OsString::from("--no-cookies-from-browser"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn youtube_media_403_is_retried_once_without_cookies() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fake-yt-dlp");
+        write_executable(
+            &program,
+            r#"#!/bin/sh
+set -eu
+printf 'call\n' >> "$0.calls"
+output=
+no_cookie_file=false
+no_browser_cookies=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            shift
+            output=$1
+            ;;
+        --no-cookies)
+            no_cookie_file=true
+            ;;
+        --no-cookies-from-browser)
+            no_browser_cookies=true
+            ;;
+    esac
+    shift
+done
+if [ "$no_cookie_file" != true ] || [ "$no_browser_cookies" != true ]; then
+    printf '%s\n' 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2
+    exit 1
+fi
+printf 'media' > "$output"
+printf '%s\n' 'DLOOR_PROGRESS|50%|5|10|NA|NA|NA|NA|137|1MiB/s|00:01'
+printf 'DLOOR_OUTPUT|%s\n' "$output"
+printf '%s\n' 'DLOOR_HEIGHT|720'
+"#,
+        )
+        .await;
+
+        let job = youtube_test_job(
+            program.clone(),
+            CookieSource::Browser {
+                browser: crate::Browser::Firefox,
+            },
+        );
+        let output_path = dir.path().join("output.mp4");
+        let (tx, mut rx) = mpsc::channel(4);
+
+        let output = job
+            .run_ytdlp(
+                &output_path,
+                DownloadTarget::NoPlaylist,
+                single_test_item(),
+                0,
+                Platform::YouTube,
+                &tx,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            output.path,
+            dir.path().join(".dloor-public-retry/output.mp4")
+        );
+        assert_eq!(fs::read(&output.path).await.unwrap(), b"media");
+        assert!(output
+            .warnings
+            .iter()
+            .any(|warning| warning.kind == DownloadWarningKind::CookieFallback));
+        let calls = fs::read_to_string(format!("{}.calls", program.display()))
+            .await
+            .unwrap();
+        assert_eq!(calls.lines().count(), 2);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DownloadEvent::Progress { progress, .. })
+                if progress.item_percent == 25.0
+                    && progress.speed == "1MiB/s"
+                    && progress.eta == "00:01"
+        ));
+    }
+
+    #[tokio::test]
+    async fn cookie_fallback_warning_does_not_mask_retry_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fake-yt-dlp");
+        write_executable(
+            &program,
+            r#"#!/bin/sh
+set -eu
+output=
+no_browser_cookies=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            shift
+            output=$1
+            ;;
+        --no-cookies-from-browser)
+            no_browser_cookies=true
+            ;;
+    esac
+    shift
+done
+if [ "$no_browser_cookies" != true ]; then
+    printf '%s\n' 'ERROR: unable to download video data: HTTP Error 403: Forbidden' >&2
+    exit 1
+fi
+printf 'media' > "$output"
+printf 'DLOOR_OUTPUT|%s\n' "$output"
+printf '%s\n' 'ERROR: second attempt failed' >&2
+exit 1
+"#,
+        )
+        .await;
+        let job = youtube_test_job(
+            program,
+            CookieSource::Browser {
+                browser: crate::Browser::Firefox,
+            },
+        );
+        let (tx, _rx) = mpsc::channel(4);
+
+        let result = job
+            .run_ytdlp(
+                &dir.path().join("output.mp4"),
+                DownloadTarget::NoPlaylist,
+                single_test_item(),
+                0,
+                Platform::YouTube,
+                &tx,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::ProcessFailed(message)) if message.contains("second attempt failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn process_failure_is_not_masked_by_a_missing_output_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fake-yt-dlp");
+        write_executable(
+            &program,
+            "#!/bin/sh\nprintf '%s\\n' 'ERROR: deliberate failure' >&2\nexit 1\n",
+        )
+        .await;
+        let job = youtube_test_job(program, CookieSource::None);
+        let (tx, _rx) = mpsc::channel(4);
+
+        let result = job
+            .run_ytdlp(
+                &dir.path().join("output.mp4"),
+                DownloadTarget::NoPlaylist,
+                single_test_item(),
+                0,
+                Platform::YouTube,
+                &tx,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::ProcessFailed(message)) if message.contains("deliberate failure")
+        ));
     }
 
     #[tokio::test]
@@ -2056,7 +2529,23 @@ mod tests {
     }
 
     #[test]
-    fn resolution_formats_use_a_bounded_selector_with_an_explicit_fallback() {
+    fn best_video_prefers_h264_aac_but_accepts_mp4_with_unknown_codecs() {
+        let args = format_args(Format::Video, Quality::Best);
+
+        assert!(args.contains(&OsString::from(
+            "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
+             best[vcodec^=avc1][acodec^=mp4a]/\
+             bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/\
+             bestvideo*+bestaudio/best"
+        )));
+        assert!(args
+            .windows(2)
+            .any(|args| args == ["--merge-output-format", "mp4"]));
+        assert!(args.windows(2).any(|args| args == ["--remux-video", "mp4"]));
+    }
+
+    #[test]
+    fn resolution_formats_bound_compatible_mp4_video() {
         for (quality, height) in [
             (Quality::P720, 720),
             (Quality::P1080, 1080),
@@ -2064,9 +2553,15 @@ mod tests {
             (Quality::P2160, 2160),
         ] {
             let args = format_args(Format::Video, quality);
-            let selector =
-                format!("bestvideo*[height<={height}]+bestaudio/best[height<={height}]/best");
+            let selector = format!(
+                "bestvideo[vcodec^=avc1][height<={height}]+bestaudio[acodec^=mp4a]/\
+                 best[vcodec^=avc1][acodec^=mp4a][height<={height}]/\
+                 bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/\
+                 best[ext=mp4][height<={height}]/\
+                 bestvideo*[height<={height}]+bestaudio/best[height<={height}]"
+            );
             assert!(args.contains(&OsString::from(selector)));
+            assert!(args.windows(2).any(|args| args == ["--remux-video", "mp4"]));
         }
         assert_eq!(parse_height_line("DLOOR_HEIGHT|1080"), Some(1080));
         assert_eq!(parse_height_line("DLOOR_HEIGHT|NA"), None);

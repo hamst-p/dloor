@@ -686,42 +686,81 @@ fn render_download(
         body[0],
     );
 
-    let item_percent = active
-        .and_then(|download| download.progress.as_ref())
-        .map_or(0.0, |progress| progress.item_percent);
+    let spinner = ["|", "/", "-", "\\"][spinner_index % 4];
+    let progress = active.and_then(|download| download.progress.as_ref());
+    let item_percent = progress.map_or(0.0, |progress| progress.item_percent);
+    let item_gauge_label = progress.map_or_else(
+        || format!("{spinner} waiting for download data"),
+        |progress| {
+            format!(
+                "{:.1}%  •  {}  •  ETA {}",
+                progress.item_percent,
+                display_progress_value(&progress.speed),
+                display_progress_value(&progress.eta)
+            )
+        },
+    );
     frame.render_widget(
         Gauge::default()
             .block(Block::default().title("Current item").borders(Borders::ALL))
-            .gauge_style(Style::new().fg(Color::Green))
-            .percent(item_percent.round() as u16),
+            .gauge_style(
+                Style::new()
+                    .fg(Color::Green)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .label(item_gauge_label)
+            .use_unicode(true)
+            .ratio((item_percent / 100.0).clamp(0.0, 1.0)),
         body[1],
     );
 
-    let overall_percent = active
-        .and_then(|download| download.progress.as_ref())
-        .map_or(0.0, |progress| progress.overall_percent);
-    frame.render_widget(
-        Gauge::default()
-            .block(Block::default().title("Overall").borders(Borders::ALL))
-            .gauge_style(Style::new().fg(Color::Cyan))
-            .percent(overall_percent.round() as u16),
-        body[2],
-    );
-
-    let spinner = ["|", "/", "-", "\\"][spinner_index % 4];
-    let detail = active
-        .and_then(|download| download.progress.as_ref())
+    let overall_percent = progress.map_or(0.0, |progress| progress.overall_percent);
+    let overall_gauge_label = active
+        .and_then(|download| download.item.as_ref())
         .map_or_else(
-            || format!("{spinner} {status_text}"),
-            |progress| {
+            || format!("{overall_percent:.1}%"),
+            |item| {
                 format!(
-                    "Item {:.1}% | Overall {:.1}% | Speed: {} | ETA: {}",
-                    progress.item_percent, progress.overall_percent, progress.speed, progress.eta
+                    "{overall_percent:.1}%  •  item {}/{}",
+                    item.index, item.total
                 )
             },
         );
+    frame.render_widget(
+        Gauge::default()
+            .block(Block::default().title("Overall").borders(Borders::ALL))
+            .gauge_style(
+                Style::new()
+                    .fg(Color::Cyan)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .label(overall_gauge_label)
+            .use_unicode(true)
+            .ratio((overall_percent / 100.0).clamp(0.0, 1.0)),
+        body[2],
+    );
+
+    let detail = progress.map_or_else(
+        || format!("{spinner} {status_text}"),
+        |progress| {
+            format!(
+                "{spinner} {status_text}  •  current {:.1}%  •  overall {:.1}%",
+                progress.item_percent, progress.overall_percent
+            )
+        },
+    );
     frame.render_widget(Paragraph::new(detail).alignment(Alignment::Center), body[3]);
     render_footer(frame, chunks[2], "Esc: cancel download");
+}
+
+fn display_progress_value(value: &str) -> &str {
+    if value.trim().is_empty() || value.eq_ignore_ascii_case("NA") {
+        "—"
+    } else {
+        value
+    }
 }
 
 fn render_complete(frame: &mut Frame<'_>, state: &CompleteState) {

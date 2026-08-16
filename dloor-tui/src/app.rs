@@ -559,6 +559,12 @@ impl SharedState {
         self.clipboard_receiver = None;
     }
 
+    fn mark_url_submitted(&mut self, url: &str) {
+        self.last_clipboard_candidate = Some(url.trim().to_string());
+        self.clipboard_checked_for_main = true;
+        self.clipboard_receiver = None;
+    }
+
     fn poll_dependency_check(&mut self) -> Option<DependencyReport> {
         let receiver = self.dependency_receiver.as_mut()?;
         let event = receiver.try_recv().ok()?;
@@ -1215,6 +1221,7 @@ fn handle_quality_key(
                 playlist: state.playlist,
             };
             shared.enqueue(request, state.title.clone());
+            shared.mark_url_submitted(&state.url);
             return Transition::ReturnToMain { clear_input: true };
         }
         _ => {}
@@ -1817,5 +1824,38 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn submitting_a_download_keeps_the_cleared_url_field_empty() {
+        let mut shared = shared_state(false);
+        let Screen::Quality(mut quality) = quality_screen() else {
+            unreachable!();
+        };
+        let submitted_url = quality.url.clone();
+
+        let transition = handle_quality_key(
+            &mut quality,
+            &mut shared,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+
+        assert!(matches!(
+            transition,
+            Transition::ReturnToMain { clear_input: true }
+        ));
+        assert_eq!(
+            shared.last_clipboard_candidate.as_deref(),
+            Some(submitted_url.as_str())
+        );
+        assert!(shared.clipboard_checked_for_main);
+        assert_eq!(
+            clipboard_url_candidate(
+                &submitted_url,
+                "",
+                shared.last_clipboard_candidate.as_deref()
+            ),
+            None
+        );
     }
 }

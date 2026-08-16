@@ -170,11 +170,12 @@ async fn run_url(
             }
             DownloadEvent::Progress { progress, item, .. } => {
                 if show_progress {
+                    let bar = text_progress_bar(progress.overall_percent, 24);
                     eprint!(
-                        "\r\u{1b}[2K[URL {url_index}/{url_total}][item {}/{}] overall {:5.1}% | item {:5.1}% | {} | ETA {}",
+                        "\r\u{1b}[2K[{bar}] {:5.1}% | URL {url_index}/{url_total} | item {}/{} {:5.1}% | {} | ETA {}",
+                        progress.overall_percent,
                         item.index,
                         item.total,
-                        progress.overall_percent,
                         progress.item_percent,
                         display_or_dash(&progress.speed),
                         display_or_dash(&progress.eta),
@@ -274,6 +275,12 @@ fn display_or_dash(value: &str) -> &str {
     }
 }
 
+fn text_progress_bar(percent: f64, width: usize) -> String {
+    let fraction = (percent / 100.0).clamp(0.0, 1.0);
+    let filled = (fraction * width as f64).round() as usize;
+    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+}
+
 fn emit_report(report: &JsonReport, json: bool) -> io::Result<()> {
     let stdout = io::stdout();
     let mut writer = stdout.lock();
@@ -310,4 +317,17 @@ fn fatal_failure(json: bool, message: String, exit_code: u8) -> ExitCode {
         eprintln!("dloor-cli: {message}");
     }
     ExitCode::from(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_bar_clamps_and_fills_to_the_requested_width() {
+        assert_eq!(text_progress_bar(-1.0, 5), "░░░░░");
+        assert_eq!(text_progress_bar(40.0, 5), "██░░░");
+        assert_eq!(text_progress_bar(100.0, 5), "█████");
+        assert_eq!(text_progress_bar(120.0, 5), "█████");
+    }
 }

@@ -1,6 +1,7 @@
 # dloor
 
 [![CI](https://github.com/hamst-p/dloor/actions/workflows/ci.yml/badge.svg)](https://github.com/hamst-p/dloor/actions/workflows/ci.yml)
+![release date](https://img.shields.io/github/hamst-p/dloor)
 
 > Educational purpose only.
 >
@@ -41,7 +42,7 @@ dloor is early-stage OSS software. The local download flow is the primary suppor
 - Preview a playlist's total count and first five titles without fetching every item
 - Expand an authorized playlist and process its items sequentially
 - Continue a playlist after individual item failures and report a final summary
-- Show separate current-item and overall playlist progress
+- Show labeled current-item and overall progress bars with speed and ETA
 - Queue multiple downloads while one job runs in the background
 - Reorder, remove, monitor, or cancel queued jobs
 - Keep the latest 500 item results in a local JSON Lines history
@@ -260,9 +261,10 @@ the explicit `--allow-generic` flag; the TUI's remembered confirmation setting
 does not silently opt a script into unverified hosts.
 
 Successful final paths are written one per line to stdout. Diagnostics,
-warnings, and interactive progress use stderr; progress is suppressed unless
-both streams are terminals, so stdout remains safe to pipe. `--json` replaces
-the path lines with one versioned JSON document and suppresses progress.
+warnings, and an interactive overall progress bar use stderr; progress is
+suppressed unless both streams are terminals, so stdout remains safe to pipe.
+`--json` replaces the path lines with one versioned JSON document and suppresses
+progress.
 
 The CLI returns `0` only when every item succeeds, `1` for execution or partial
 failure, `2` for invalid arguments, and `130` after Ctrl-C has cancelled the
@@ -334,12 +336,15 @@ the active process and discards waiting jobs before the application exits.
 
 ## Quality Presets
 
-- Video / Best: downloads `bestvideo*+bestaudio/best` and merges to mp4
+- Video / Best: prefers the best available H.264 video and AAC audio, then
+  merges/remuxes to MP4. If a platform such as X omits codec metadata, dloor
+  falls back to its best audio/video MP4 instead of rejecting the format.
 - Video / Compressed: downloads up to 1080p, then re-encodes with `ffmpeg`
   using the validated `[transcode]` preset; the pre-transcode source file is
   removed after a successful conversion
-- Video / 720p, 1080p, 1440p, or 2160p: chooses the highest available
-  video stream at or below the selected height and merges the best audio
+- Video / 720p, 1080p, 1440p, or 2160p: prefers the highest available H.264
+  video stream at or below the selected height and AAC audio, with the same MP4
+  fallback for incomplete codec metadata
 - Audio / Best: extracts m4a at best available quality
 - Audio / Compressed: extracts mp3 with `--audio-quality 5`
 
@@ -407,7 +412,9 @@ Leave the field empty in `/settings` for no limit. The value is passed to
 yt-dlp as `--limit-rate` only for actual downloads, not metadata or playlist
 preview requests.
 
-Metadata previews use the same optional cookie setting as the eventual download.
+Metadata previews and the first download attempt use the same optional cookie
+setting. The narrow YouTube HTTP 403 fallback described below explicitly
+disables cookies for its retry.
 Playlist previews are limited to the first five entries;
 this limit is fixed and does not add a `config.toml` field.
 
@@ -532,6 +539,12 @@ Some platforms change frequently, require login, or block automated downloads. U
 ```bash
 yt-dlp -U
 ```
+
+For YouTube and YouTube Shorts, if a cookie-backed media request fails with HTTP
+403, dloor retries that item once with cookies explicitly disabled. This can
+recover public media when the site's cookie-backed delivery path is temporarily
+rejected. A successful retry is reported as a completion warning; content that
+actually requires the account still fails normally.
 
 If that does not work, verify that the URL is public and that you have permission to download it.
 For an unknown host, “Generic (yt-dlp)” means the URL passed dloor's safety and

@@ -387,6 +387,7 @@ pub const fn warning_kind_name(kind: DownloadWarningKind) -> &'static str {
         DownloadWarningKind::SubtitleSidecar => "subtitle_sidecar",
         DownloadWarningKind::OptionalPostProcessing => "optional_post_processing",
         DownloadWarningKind::ResolutionFallback => "resolution_fallback",
+        DownloadWarningKind::CookieFallback => "cookie_fallback",
     }
 }
 
@@ -629,5 +630,13 @@ mod tests {
         assert!(report.success);
         assert_eq!(report.results[0].status, UrlStatus::Succeeded);
         assert_eq!(report.results[0].warnings.len(), 1);
+    }
+
+    #[test]
+    fn cookie_fallback_has_a_stable_json_warning_kind() {
+        assert_eq!(
+            warning_kind_name(DownloadWarningKind::CookieFallback),
+            "cookie_fallback"
+        );
     }
 }
