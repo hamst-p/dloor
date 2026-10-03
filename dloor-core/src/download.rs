@@ -1733,16 +1733,17 @@ async fn transcode_video(
         .ok_or_else(|| Error::InvalidPath(input.display().to_string()))?
         .to_string_lossy();
     let output = input.with_file_name(format!("{stem}.compressed.mp4"));
-    let mut child = Command::new("ffmpeg")
-        .args(transcode_args(input, &output, preset))
-        .kill_on_drop(true)
-        .spawn()?;
-    let status = wait_for_process(&mut child, cancellation).await?;
+    let mut command = Command::new("ffmpeg");
+    command.args(transcode_args(input, &output, preset));
+    let (status, stderr) = run_quietly(command, cancellation).await?;
 
     if status.success() {
         finalize_transcode(input, &output).await
     } else {
-        Err(Error::ProcessFailed(format!("ffmpeg exited with {status}")))
+        Err(Error::ProcessFailed(failure_message(
+            &format!("ffmpeg exited with {status}"),
+            &stderr,
+        )))
     }
 }
 
@@ -1919,13 +1920,10 @@ async fn make_quicktime_compatible(
         .ok_or_else(|| Error::InvalidPath(input.display().to_string()))?
         .to_string_lossy();
     let temp_output = input.with_file_name(format!("{stem}.dloor-quicktime.mp4"));
-    let mut child = Command::new("ffmpeg")
-        .args(quicktime_fix_args(input, &temp_output, fix))
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()?;
-    let status = match wait_for_process(&mut child, cancellation).await {
-        Ok(status) => status,
+    let mut command = Command::new("ffmpeg");
+    command.args(quicktime_fix_args(input, &temp_output, fix));
+    let (status, stderr) = match run_quietly(command, cancellation).await {
+        Ok(result) => result,
         Err(error) => {
             fs::remove_file(&temp_output).await.ok();
             return Err(error);
@@ -1933,8 +1931,9 @@ async fn make_quicktime_compatible(
     };
     if !status.success() {
         fs::remove_file(&temp_output).await.ok();
-        return Err(Error::ProcessFailed(format!(
-            "ffmpeg could not convert the video for QuickTime (exited with {status})"
+        return Err(Error::ProcessFailed(failure_message(
+            &format!("ffmpeg could not convert the video for QuickTime (exited with {status})"),
+            &stderr,
         )));
     }
     let converted = finalize_transcode(input, &temp_output).await?;
@@ -1950,16 +1949,72 @@ async fn upload_to_cloud(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     let target = format!("{}:{}", remote, remote_path.trim_matches('/'));
-    let mut child = Command::new("rclone")
-        .args(["copy", file.to_string_lossy().as_ref(), target.as_str()])
-        .kill_on_drop(true)
-        .spawn()?;
-    let status = wait_for_process(&mut child, cancellation).await?;
+    let mut command = Command::new("rclone");
+    command.args(["copy", file.to_string_lossy().as_ref(), target.as_str()]);
+    let (status, stderr) = run_quietly(command, cancellation).await?;
     if status.success() {
         fs::remove_file(file).await.ok();
         Ok(())
     } else {
-        Err(Error::ProcessFailed(format!("rclone exited with {status}")))
+        Err(Error::ProcessFailed(failure_message(
+            &format!("rclone exited with {status}"),
+            &stderr,
+        )))
+    }
+}
+
+/// Keeps at most this much of a helper tool's stderr for error messages.
+const MAX_CAPTURED_STDERR: usize = 16 * 1024;
+
+/// Runs a helper tool (ffmpeg, rclone) without letting it write to the terminal,
+/// which would draw over the TUI. stderr is drained concurrently so the child can
+/// never block on a full pipe, and its tail is returned for error reporting.
+async fn run_quietly(
+    mut command: Command,
+    cancellation: &CancellationToken,
+) -> Result<(std::process::ExitStatus, String)> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let stderr = child.stderr.take();
+    let reader = tokio::spawn(async move {
+        let mut captured = Vec::new();
+        if let Some(mut stderr) = stderr {
+            let mut buffer = [0_u8; 8192];
+            while let Ok(read) = tokio::io::AsyncReadExt::read(&mut stderr, &mut buffer).await {
+                if read == 0 {
+                    break;
+                }
+                captured.extend_from_slice(&buffer[..read]);
+                if captured.len() > MAX_CAPTURED_STDERR {
+                    captured.drain(..captured.len() - MAX_CAPTURED_STDERR);
+                }
+            }
+        }
+        String::from_utf8_lossy(&captured).into_owned()
+    });
+    let status = wait_for_process(&mut child, cancellation).await;
+    let stderr = reader.await.unwrap_or_default();
+    let status = status?;
+    if !status.success() {
+        debug!(stderr = %stderr, "helper process failed");
+    }
+    Ok((status, stderr))
+}
+
+/// Appends the last meaningful stderr line from a failed helper tool.
+fn failure_message(summary: &str, stderr: &str) -> String {
+    let detail = stderr
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty());
+    match detail {
+        Some(line) => format!("{summary}: {line}"),
+        None => summary.to_string(),
     }
 }
 
@@ -2894,6 +2949,35 @@ exit 1
         assert_eq!(converted.video.unwrap().0, "h264");
         assert_eq!(converted.audio, vec!["aac".to_string()]);
         assert!(!dir.path().join("reel [abc].dloor-quicktime.mp4").exists());
+    }
+
+    #[tokio::test]
+    async fn helper_output_is_captured_instead_of_reaching_the_terminal() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "echo to-stdout; echo first >&2; echo 'last error' >&2; exit 3",
+        ]);
+        let (status, stderr) = run_quietly(command, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!status.success());
+        assert!(!stderr.contains("to-stdout"));
+        assert_eq!(
+            failure_message("tool exited", &stderr),
+            "tool exited: last error"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_helper_stderr_does_not_block_and_is_truncated() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "i=0; while [ $i -lt 4000 ]; do echo 'progress line padding padding padding' >&2; i=$((i+1)); done"]);
+        let (status, stderr) = run_quietly(command, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(status.success());
+        assert!(stderr.len() <= MAX_CAPTURED_STDERR);
     }
 
     #[test]

@@ -265,7 +265,9 @@ fn on_off(value: bool) -> &'static str {
 }
 
 fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
-    let area = centered(frame.area(), 96, 23);
+    let downloading = shared.active_download.as_ref();
+    let panel_height = if downloading.is_some() { 3 } else { 0 };
+    let area = centered(frame.area(), 96, 23 + panel_height);
     let body = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -279,6 +281,7 @@ fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
             Constraint::Length(2),
             Constraint::Length(3),
             Constraint::Length(2),
+            Constraint::Length(panel_height),
         ])
         .split(area);
 
@@ -339,10 +342,85 @@ fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
             .fg(Color::DarkGray),
         body[9],
     );
+    if let Some(active) = downloading {
+        render_main_download_panel(frame, body[10], active, shared);
+    }
     render_footer(
         frame,
         footer_area(frame.area()),
         "Paste URL, then Enter  Ctrl+U: clear input",
+    );
+}
+
+/// Compact progress panel shown on the main screen while a download runs.
+fn render_main_download_panel(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    active: &ActiveDownload,
+    shared: &SharedState,
+) {
+    let title = active
+        .item
+        .as_ref()
+        .map(|item| item.title.clone())
+        .or_else(|| {
+            shared
+                .queue
+                .entry(active.job_id)
+                .map(|job| job.title.clone())
+        })
+        .unwrap_or_default();
+    let mut block_title = format!(" Downloading: {} ", truncate_text(&title, 60));
+    if let Some(item) = active.item.as_ref().filter(|item| item.total > 1) {
+        block_title = format!(
+            " Downloading {}/{}: {} ",
+            item.index,
+            item.total,
+            truncate_text(&title, 52)
+        );
+    }
+    let pending = shared.queue.pending_count();
+    let queued_note = if pending > 0 {
+        format!(" +{pending} queued  /queue ")
+    } else {
+        " /queue for details ".to_string()
+    };
+
+    let spinner = ["|", "/", "-", "\\"][shared.spinner_index % 4];
+    let progress = active.progress.as_ref();
+    let percent = progress.map_or(0.0, |progress| progress.overall_percent);
+    let label = match progress {
+        Some(progress) if active.status_text == "Downloading" => format!(
+            "{:.1}%  •  {}  •  ETA {}",
+            progress.overall_percent,
+            display_progress_value(&progress.speed),
+            display_progress_value(&progress.eta)
+        ),
+        Some(progress) => format!(
+            "{:.1}%  •  {spinner} {}",
+            progress.overall_percent, active.status_text
+        ),
+        None => format!("{spinner} {}", active.status_text),
+    };
+    frame.render_widget(
+        Gauge::default()
+            .block(
+                Block::default()
+                    .title(block_title)
+                    .title_bottom(Line::from(queued_note).right_aligned().fg(Color::DarkGray))
+                    .borders(Borders::ALL)
+                    .border_style(Style::new().fg(Color::Green)),
+            )
+            .gauge_style(
+                Style::new()
+                    .fg(Color::Green)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .label(label)
+            .use_unicode(true)
+            .ratio((percent / 100.0).clamp(0.0, 1.0)),
+        area,
     );
 }
 
@@ -842,22 +920,41 @@ fn render_queue(frame: &mut Frame<'_>, state: &QueueState, shared: &SharedState)
         .iter()
         .enumerate()
         .map(|(index, job)| {
-            let marker = if index == state.selected { "> " } else { "  " };
-            let progress = job.progress.as_ref().map_or_else(String::new, |progress| {
-                format!(" {:>5.1}%", progress.overall_percent)
-            });
-            let style = if index == state.selected {
+            let selected = index == state.selected;
+            let marker = if selected { "> " } else { "  " };
+            let text_style = if selected {
                 Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
             };
-            ListItem::new(format!(
-                "{marker}#{:<3} {:<8}{progress} {}",
-                job.id.0,
-                job.status.label(),
-                truncate_text(&job.title, 52)
-            ))
-            .style(style)
+            // The running job's live progress lives on the active download.
+            let progress = shared
+                .active_for(job.id)
+                .and_then(|active| active.progress.as_ref())
+                .or(job.progress.as_ref());
+            let running = job.status == dloor_core::QueueStatus::Running;
+            let (bar, percent) = match progress {
+                Some(progress) => (
+                    progress_bar(progress.overall_percent, QUEUE_BAR_WIDTH),
+                    format!("{:>5.1}%", progress.overall_percent.clamp(0.0, 100.0)),
+                ),
+                None => (progress_bar(0.0, QUEUE_BAR_WIDTH), "  —  ".to_string()),
+            };
+            let bar_color = if running {
+                Color::Green
+            } else {
+                Color::DarkGray
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{marker}#{:<3} {:<8} ", job.id.0, job.status.label()),
+                    text_style,
+                ),
+                Span::styled(bar.filled, Style::new().fg(bar_color)),
+                Span::styled(bar.empty, Style::new().fg(Color::DarkGray)),
+                Span::styled(format!(" {percent}  "), text_style),
+                Span::styled(truncate_text(&job.title, 40), text_style),
+            ]))
         })
         .collect();
     let list = if items.is_empty() {
@@ -1011,6 +1108,33 @@ fn render_error(frame: &mut Frame<'_>, state: &ErrorState) {
     render_footer(frame, chunks[1], &footer);
 }
 
+const QUEUE_BAR_WIDTH: usize = 20;
+
+#[derive(Debug, PartialEq, Eq)]
+struct ProgressBar {
+    filled: String,
+    empty: String,
+}
+
+/// Text progress bar with 1/8-cell precision, for places a full Gauge widget does not fit
+/// (such as one row of a list).
+fn progress_bar(percent: f64, width: usize) -> ProgressBar {
+    const PARTIAL: [char; 8] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    let eighths = ((percent.clamp(0.0, 100.0) / 100.0) * (width * 8) as f64).round() as usize;
+    let full = eighths / 8;
+    let remainder = eighths % 8;
+    let mut filled = "█".repeat(full);
+    let mut used = full;
+    if remainder > 0 {
+        filled.push(PARTIAL[remainder]);
+        used += 1;
+    }
+    ProgressBar {
+        filled,
+        empty: "░".repeat(width.saturating_sub(used)),
+    }
+}
+
 fn render_queue_indicator(frame: &mut Frame<'_>, shared: &SharedState) {
     let width = 58u16.min(frame.area().width);
     let area = Rect {
@@ -1076,4 +1200,32 @@ fn footer_area(area: Rect) -> Rect {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(2)])
         .split(area)[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cells(bar: &ProgressBar) -> usize {
+        bar.filled.chars().count() + bar.empty.chars().count()
+    }
+
+    #[test]
+    fn progress_bar_keeps_a_fixed_width_and_clamps() {
+        for percent in [-5.0, 0.0, 1.0, 33.3, 50.0, 99.9, 100.0, 140.0] {
+            assert_eq!(cells(&progress_bar(percent, 20)), 20, "{percent}");
+        }
+        assert_eq!(progress_bar(0.0, 4).filled, "");
+        assert_eq!(progress_bar(100.0, 4).filled, "████");
+        assert_eq!(progress_bar(150.0, 4).empty, "");
+    }
+
+    #[test]
+    fn progress_bar_shows_partial_cells() {
+        let half = progress_bar(50.0, 10);
+        assert_eq!(half.filled, "█████");
+        assert_eq!(half.empty, "░░░░░");
+        // 1/16 of 10 cells = 5 eighths -> one partial cell.
+        assert_eq!(progress_bar(6.25, 10).filled, "▋");
+    }
 }
