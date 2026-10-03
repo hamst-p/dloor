@@ -321,8 +321,16 @@ fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
         body[7],
     );
     frame.render_widget(
-        Paragraph::new(state.url_input.as_str())
-            .block(Block::default().title("Input URL").borders(Borders::ALL)),
+        Paragraph::new(state.url_input.as_str()).block(
+            Block::default()
+                .title("Input URL")
+                .title_bottom(
+                    Line::from(" Ctrl+U: clear ")
+                        .right_aligned()
+                        .fg(Color::DarkGray),
+                )
+                .borders(Borders::ALL),
+        ),
         body[8],
     );
     frame.render_widget(
@@ -331,7 +339,11 @@ fn render_main(frame: &mut Frame<'_>, state: &MainState, shared: &SharedState) {
             .fg(Color::DarkGray),
         body[9],
     );
-    render_footer(frame, footer_area(frame.area()), "Paste URL, then Enter");
+    render_footer(
+        frame,
+        footer_area(frame.area()),
+        "Paste URL, then Enter  Ctrl+U: clear input",
+    );
 }
 
 fn render_update_confirm(frame: &mut Frame<'_>) {

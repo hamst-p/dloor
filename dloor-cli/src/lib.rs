@@ -388,6 +388,7 @@ pub const fn warning_kind_name(kind: DownloadWarningKind) -> &'static str {
         DownloadWarningKind::OptionalPostProcessing => "optional_post_processing",
         DownloadWarningKind::ResolutionFallback => "resolution_fallback",
         DownloadWarningKind::CookieFallback => "cookie_fallback",
+        DownloadWarningKind::PlayerCompatibility => "player_compatibility",
     }
 }
 

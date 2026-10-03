@@ -140,6 +140,7 @@ pub enum DownloadWarningKind {
     OptionalPostProcessing,
     ResolutionFallback,
     CookieFallback,
+    PlayerCompatibility,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,7 +377,33 @@ impl DownloadJob {
             })
             .await
             .ok();
+            ensure_video_stream(&downloaded).await?;
             transcode_video(&downloaded, &self.config.transcode, &self.cancellation).await?
+        } else if self.request.format == Format::Video {
+            match probe_streams(&downloaded).await {
+                Ok(streams) => match plan_quicktime_fix(&streams)? {
+                    Some(plan) => {
+                        tx.send(DownloadEvent::Converting {
+                            item: resolved.display.clone(),
+                        })
+                        .await
+                        .ok();
+                        make_quicktime_compatible(&downloaded, &plan, &self.cancellation).await?
+                    }
+                    None => downloaded,
+                },
+                Err(Error::MissingTool(tool)) => {
+                    warnings.push(DownloadWarning {
+                        item: resolved.display.clone(),
+                        kind: DownloadWarningKind::PlayerCompatibility,
+                        message: format!(
+                            "{tool} was not found, so the video codec could not be checked; QuickTime may not play this file."
+                        ),
+                    });
+                    downloaded
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             downloaded
         };
@@ -1038,7 +1065,7 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
             "-f".into(),
             concat!(
                 "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/",
-                "best[vcodec^=avc1][acodec^=mp4a]/",
+                "best[vcodec^=avc1][acodec!=?none]/",
                 "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/",
                 "bestvideo*+bestaudio/best"
             )
@@ -1080,7 +1107,7 @@ fn format_args(format: Format, quality: Quality) -> Vec<OsString> {
                 "-f".into(),
                 format!(
                     "bestvideo[vcodec^=avc1][height<={height}]+bestaudio[acodec^=mp4a]/\
-                     best[vcodec^=avc1][acodec^=mp4a][height<={height}]/\
+                     best[vcodec^=avc1][acodec!=?none][height<={height}]/\
                      bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/\
                      best[ext=mp4][height<={height}]/\
                      bestvideo*[height<={height}]+bestaudio/best[height<={height}]"
@@ -1728,6 +1755,192 @@ async fn finalize_transcode(input: &Path, output: &Path) -> Result<PathBuf> {
     }
     fs::remove_file(input).await?;
     Ok(output.to_path_buf())
+}
+
+/// Codecs found in a downloaded file, as reported by ffprobe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ProbedStreams {
+    /// First video stream that is not an embedded cover image: (codec_name, codec_tag_string).
+    video: Option<(String, String)>,
+    audio: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoFix {
+    Copy,
+    TagHvc1,
+    ReencodeH264,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuickTimeFix {
+    video: VideoFix,
+    reencode_audio: bool,
+}
+
+/// Audio codecs QuickTime Player can decode inside an MP4 container.
+const QUICKTIME_AUDIO_CODECS: &[&str] = &["aac", "mp3", "alac", "ac3", "eac3"];
+
+fn parse_ffprobe_streams(json: &str) -> Result<ProbedStreams> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let mut probed = ProbedStreams::default();
+    for stream in value["streams"].as_array().into_iter().flatten() {
+        let codec = stream["codec_name"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        match stream["codec_type"].as_str() {
+            Some("video") => {
+                let cover_art = stream["disposition"]["attached_pic"].as_i64() == Some(1);
+                if !cover_art && probed.video.is_none() {
+                    let tag = stream["codec_tag_string"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    probed.video = Some((codec, tag));
+                }
+            }
+            Some("audio") => probed.audio.push(codec),
+            _ => {}
+        }
+    }
+    Ok(probed)
+}
+
+/// Decides what (if anything) must change for QuickTime Player to open the file.
+/// Errors when the file has no real video track, so an audio-only result is never
+/// reported as a successful video download.
+fn plan_quicktime_fix(streams: &ProbedStreams) -> Result<Option<QuickTimeFix>> {
+    let Some((codec, tag)) = &streams.video else {
+        return Err(Error::ProcessFailed(
+            "the downloaded file has no video track (audio only); try again or choose another quality".to_string(),
+        ));
+    };
+    let video = match codec.as_str() {
+        "h264" => VideoFix::Copy,
+        "hevc" if tag == "hvc1" => VideoFix::Copy,
+        "hevc" => VideoFix::TagHvc1,
+        _ => VideoFix::ReencodeH264,
+    };
+    let reencode_audio = streams
+        .audio
+        .iter()
+        .any(|codec| !QUICKTIME_AUDIO_CODECS.contains(&codec.as_str()));
+    if video == VideoFix::Copy && !reencode_audio {
+        Ok(None)
+    } else {
+        Ok(Some(QuickTimeFix {
+            video,
+            reencode_audio,
+        }))
+    }
+}
+
+async fn probe_streams(path: &Path) -> Result<ProbedStreams> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,codec_tag_string:stream_disposition=attached_pic",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => Error::MissingTool("ffprobe"),
+            _ => Error::Io(error),
+        })?;
+    if !output.status.success() {
+        return Err(Error::ProcessFailed(format!(
+            "ffprobe exited with {}",
+            output.status
+        )));
+    }
+    parse_ffprobe_streams(&String::from_utf8_lossy(&output.stdout))
+}
+
+async fn ensure_video_stream(path: &Path) -> Result<()> {
+    match probe_streams(path).await {
+        Ok(streams) => plan_quicktime_fix(&streams).map(|_| ()),
+        Err(Error::MissingTool(_)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn quicktime_fix_args(input: &Path, output: &Path, fix: &QuickTimeFix) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "-y".into(),
+        "-i".into(),
+        input.as_os_str().to_os_string(),
+        "-map".into(),
+        "0".into(),
+        "-dn".into(),
+        "-c".into(),
+        "copy".into(),
+    ];
+    match fix.video {
+        VideoFix::Copy => {}
+        VideoFix::TagHvc1 => args.extend(["-tag:V".into(), "hvc1".into()]),
+        VideoFix::ReencodeH264 => args.extend([
+            "-c:V".into(),
+            "libx264".into(),
+            "-crf".into(),
+            "18".into(),
+            "-preset".into(),
+            "medium".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+        ]),
+    }
+    if fix.reencode_audio {
+        args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+    }
+    args.extend([
+        "-movflags".into(),
+        "+faststart".into(),
+        output.as_os_str().to_os_string(),
+    ]);
+    args
+}
+
+/// Rewrites a downloaded video so QuickTime Player can open it (H.264/HEVC video,
+/// AAC-family audio, MP4 container), keeping the original file name.
+async fn make_quicktime_compatible(
+    input: &Path,
+    fix: &QuickTimeFix,
+    cancellation: &CancellationToken,
+) -> Result<PathBuf> {
+    let stem = input
+        .file_stem()
+        .ok_or_else(|| Error::InvalidPath(input.display().to_string()))?
+        .to_string_lossy();
+    let temp_output = input.with_file_name(format!("{stem}.dloor-quicktime.mp4"));
+    let mut child = Command::new("ffmpeg")
+        .args(quicktime_fix_args(input, &temp_output, fix))
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let status = match wait_for_process(&mut child, cancellation).await {
+        Ok(status) => status,
+        Err(error) => {
+            fs::remove_file(&temp_output).await.ok();
+            return Err(error);
+        }
+    };
+    if !status.success() {
+        fs::remove_file(&temp_output).await.ok();
+        return Err(Error::ProcessFailed(format!(
+            "ffmpeg could not convert the video for QuickTime (exited with {status})"
+        )));
+    }
+    let converted = finalize_transcode(input, &temp_output).await?;
+    let final_path = input.with_extension("mp4");
+    fs::rename(&converted, &final_path).await?;
+    Ok(final_path)
 }
 
 async fn upload_to_cloud(
@@ -2534,7 +2747,7 @@ exit 1
 
         assert!(args.contains(&OsString::from(
             "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/\
-             best[vcodec^=avc1][acodec^=mp4a]/\
+             best[vcodec^=avc1][acodec!=?none]/\
              bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/\
              bestvideo*+bestaudio/best"
         )));
@@ -2555,7 +2768,7 @@ exit 1
             let args = format_args(Format::Video, quality);
             let selector = format!(
                 "bestvideo[vcodec^=avc1][height<={height}]+bestaudio[acodec^=mp4a]/\
-                 best[vcodec^=avc1][acodec^=mp4a][height<={height}]/\
+                 best[vcodec^=avc1][acodec!=?none][height<={height}]/\
                  bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/\
                  best[ext=mp4][height<={height}]/\
                  bestvideo*[height<={height}]+bestaudio/best[height<={height}]"
@@ -2575,6 +2788,112 @@ exit 1
             bandwidth_args(Some(&limit)),
             [OsString::from("--limit-rate"), OsString::from("4.2M")]
         );
+    }
+
+    #[test]
+    fn instagram_selector_prefers_progressive_h264_with_unknown_audio() {
+        let args = format_args(Format::Video, Quality::Best);
+        assert!(args[1]
+            .to_string_lossy()
+            .contains("best[vcodec^=avc1][acodec!=?none]/"));
+        let args = format_args(Format::Video, Quality::P1080);
+        assert!(args[1]
+            .to_string_lossy()
+            .contains("best[vcodec^=avc1][acodec!=?none][height<=1080]"));
+    }
+
+    #[test]
+    fn ffprobe_output_skips_cover_art_and_collects_audio() {
+        let json = r#"{"streams":[
+            {"codec_name":"mjpeg","codec_tag_string":"[0][0][0][0]","codec_type":"video","disposition":{"attached_pic":1}},
+            {"codec_name":"vp9","codec_tag_string":"vp09","codec_type":"video","disposition":{"attached_pic":0}},
+            {"codec_name":"aac","codec_tag_string":"mp4a","codec_type":"audio","disposition":{"attached_pic":0}}
+        ]}"#;
+        let streams = parse_ffprobe_streams(json).unwrap();
+        assert_eq!(streams.video, Some(("vp9".to_string(), "vp09".to_string())));
+        assert_eq!(streams.audio, vec!["aac".to_string()]);
+    }
+
+    #[test]
+    fn quicktime_plan_reencodes_vp9_and_av1_but_keeps_h264() {
+        let streams = |codec: &str, tag: &str, audio: &str| ProbedStreams {
+            video: Some((codec.to_string(), tag.to_string())),
+            audio: vec![audio.to_string()],
+        };
+        let fix = |video, reencode_audio| {
+            Some(QuickTimeFix {
+                video,
+                reencode_audio,
+            })
+        };
+        assert_eq!(
+            plan_quicktime_fix(&streams("h264", "avc1", "aac")).unwrap(),
+            None
+        );
+        assert_eq!(
+            plan_quicktime_fix(&streams("hevc", "hvc1", "aac")).unwrap(),
+            None
+        );
+        assert_eq!(
+            plan_quicktime_fix(&streams("vp9", "vp09", "aac")).unwrap(),
+            fix(VideoFix::ReencodeH264, false)
+        );
+        assert_eq!(
+            plan_quicktime_fix(&streams("av1", "av01", "opus")).unwrap(),
+            fix(VideoFix::ReencodeH264, true)
+        );
+        assert_eq!(
+            plan_quicktime_fix(&streams("hevc", "hev1", "aac")).unwrap(),
+            fix(VideoFix::TagHvc1, false)
+        );
+        assert_eq!(
+            plan_quicktime_fix(&streams("h264", "avc1", "opus")).unwrap(),
+            fix(VideoFix::Copy, true)
+        );
+    }
+
+    #[test]
+    fn audio_only_video_download_is_an_error() {
+        let streams = ProbedStreams {
+            video: None,
+            audio: vec!["aac".to_string()],
+        };
+        assert!(plan_quicktime_fix(&streams).is_err());
+    }
+
+    #[tokio::test]
+    async fn vp9_download_is_converted_to_h264_with_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("reel [abc].mp4");
+        let status = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=25:duration=1",
+            ])
+            .args(["-f", "lavfi", "-i", "sine=duration=1"])
+            .args(["-c:v", "libvpx-vp9", "-c:a", "aac", "-shortest"])
+            .arg(&input)
+            .status();
+        let Ok(status) = status else {
+            return; // ffmpeg is not installed in this environment
+        };
+        assert!(status.success());
+
+        let streams = probe_streams(&input).await.unwrap();
+        let plan = plan_quicktime_fix(&streams).unwrap().unwrap();
+        let output = make_quicktime_compatible(&input, &plan, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(output, input);
+        let converted = probe_streams(&output).await.unwrap();
+        assert_eq!(converted.video.unwrap().0, "h264");
+        assert_eq!(converted.audio, vec!["aac".to_string()]);
+        assert!(!dir.path().join("reel [abc].dloor-quicktime.mp4").exists());
     }
 
     #[test]

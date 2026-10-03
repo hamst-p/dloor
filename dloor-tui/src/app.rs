@@ -1039,15 +1039,32 @@ fn handle_main_key(state: &mut MainState, shared: &mut SharedState, key: KeyEven
                 Err(error) => Transition::ShowError(error.to_string()),
             }
         }
+        _ if is_clear_input_key(key) => {
+            state.url_input.clear();
+            Transition::Stay
+        }
         KeyCode::Backspace => {
             state.url_input.pop();
             Transition::Stay
         }
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => Transition::Stay,
         KeyCode::Char(ch) => {
             state.url_input.push(ch);
             Transition::Stay
         }
         _ => Transition::Stay,
+    }
+}
+
+/// Ctrl+U (readline "kill line"), Ctrl+Backspace and Alt/Option+Backspace
+/// clear the whole URL field in one keystroke.
+fn is_clear_input_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('u' | 'U') => key.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Backspace => key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+        _ => false,
     }
 }
 
@@ -1789,6 +1806,40 @@ mod tests {
             playlist: None,
         };
         assert_eq!(metadata_qualities(&preview), [Quality::P1080]);
+    }
+
+    #[test]
+    fn clear_shortcuts_empty_the_url_input_in_one_keystroke() {
+        let shortcuts = [
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT),
+        ];
+        for key in shortcuts {
+            let mut shared = shared_state(false);
+            let mut state = MainState {
+                url_input: "https://youtube.com/watch?v=example".to_string(),
+            };
+            assert!(matches!(
+                handle_main_key(&mut state, &mut shared, key),
+                Transition::Stay
+            ));
+            assert!(state.url_input.is_empty(), "{key:?} should clear the input");
+        }
+    }
+
+    #[test]
+    fn plain_backspace_still_deletes_one_character() {
+        let mut shared = shared_state(false);
+        let mut state = MainState {
+            url_input: "https://a.b".to_string(),
+        };
+        handle_main_key(
+            &mut state,
+            &mut shared,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(state.url_input, "https://a.");
     }
 
     #[test]

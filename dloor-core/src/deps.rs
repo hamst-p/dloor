@@ -177,10 +177,9 @@ pub fn check_dependencies(config: Option<&Config>) -> DependencyReport {
         == VersionFreshness::OlderThan90Days
     {
         if let Some(version) = report.version(Tool::YtDlp) {
-            report.warnings.push(format!(
-                "yt-dlp {} is more than {YT_DLP_STALE_DAYS} days old; run /update before troubleshooting extractor failures.",
-                version.raw
-            ));
+            report
+                .warnings
+                .push(stale_warning(&version.raw, &version.executable));
         }
     }
     report
@@ -335,17 +334,82 @@ async fn run_ytdlp_update(executable: Option<&Path>) -> YtDlpUpdateOutcome {
             } else {
                 combined
             };
-            YtDlpUpdateOutcome {
+            let outcome = YtDlpUpdateOutcome {
                 success: output.status.success(),
                 update_hint: (!output.status.success()).then(|| update_hint(executable, &message)),
                 output: message,
-            }
+            };
+            let version_after = read_yt_dlp_version(executable).await;
+            verify_update(
+                outcome,
+                executable,
+                version_after,
+                OffsetDateTime::now_utc().date(),
+            )
         }
         Err(error) => YtDlpUpdateOutcome {
             success: false,
             output: format!("Could not start yt-dlp -U: {error}"),
             update_hint: Some(update_hint(executable, "")),
         },
+    }
+}
+
+/// Command that updates a yt-dlp installed by a package manager, where `yt-dlp -U`
+/// cannot replace the files itself.
+fn managed_update_command(executable: &Path) -> Option<&'static str> {
+    let path = executable.to_string_lossy().to_ascii_lowercase();
+    if path.contains("homebrew") || path.contains("/cellar/") {
+        Some("brew upgrade yt-dlp")
+    } else if path.contains("pipx") {
+        Some("pipx upgrade yt-dlp")
+    } else {
+        None
+    }
+}
+
+fn stale_warning(version: &str, executable: &Path) -> String {
+    let action = managed_update_command(executable).map_or_else(
+        || "run /update".to_string(),
+        |command| format!("update it in a terminal with: {command}"),
+    );
+    format!(
+        "yt-dlp {version} is more than {YT_DLP_STALE_DAYS} days old; {action} before troubleshooting extractor failures."
+    )
+}
+
+async fn read_yt_dlp_version(executable: &Path) -> Option<YtDlpVersion> {
+    let output = TokioCommand::new(executable)
+        .arg("--version")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    parse_yt_dlp_version(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+/// `yt-dlp -U` can exit successfully without installing anything (for example when
+/// a package manager owns the installation). Re-check the version so the result
+/// screen does not claim success while the age warning keeps appearing.
+fn verify_update(
+    outcome: YtDlpUpdateOutcome,
+    executable: &Path,
+    version_after: Option<YtDlpVersion>,
+    today: Date,
+) -> YtDlpUpdateOutcome {
+    match version_after {
+        Some(version) if outcome.success && version.is_older_than_90_days_on(today) => {
+            let output = format!(
+                "{}\n\nyt-dlp is still {version}, which is more than {YT_DLP_STALE_DAYS} days old, so a newer release was not installed.",
+                outcome.output
+            );
+            YtDlpUpdateOutcome {
+                success: false,
+                update_hint: Some(update_hint(executable, &output)),
+                output,
+            }
+        }
+        _ => outcome,
     }
 }
 
@@ -485,6 +549,50 @@ mod tests {
 
         assert!(!version.is_older_than_90_days_on(day_90));
         assert!(version.is_older_than_90_days_on(day_91));
+    }
+
+    #[test]
+    fn stale_warning_names_the_command_that_can_actually_update() {
+        let brew = stale_warning("2026.07.04", Path::new("/opt/homebrew/bin/yt-dlp"));
+        assert!(brew.contains("brew upgrade yt-dlp"));
+        assert!(!brew.contains("/update"));
+        let standalone = stale_warning("2026.07.04", Path::new("/Users/me/bin/yt-dlp"));
+        assert!(standalone.contains("run /update"));
+    }
+
+    #[test]
+    fn successful_update_that_leaves_an_old_version_is_reported_as_not_updated() {
+        let today = Date::from_calendar_date(2026, Month::October, 4).unwrap();
+        let old = YtDlpVersion {
+            year: 2026,
+            month: 7,
+            day: 4,
+        };
+        let recent = YtDlpVersion {
+            year: 2026,
+            month: 8,
+            day: 19,
+        };
+        let succeeded = || YtDlpUpdateOutcome {
+            success: true,
+            output: "yt-dlp is up to date (stable@2026.07.04)".to_string(),
+            update_hint: None,
+        };
+        let homebrew = Path::new("/opt/homebrew/bin/yt-dlp");
+
+        let still_old = verify_update(succeeded(), homebrew, Some(old), today);
+        assert!(!still_old.success);
+        assert!(still_old.output.contains("still 2026.07.04"));
+        assert!(still_old.update_hint.unwrap().contains("brew upgrade"));
+
+        assert_eq!(
+            verify_update(succeeded(), homebrew, Some(recent), today),
+            succeeded()
+        );
+        assert_eq!(
+            verify_update(succeeded(), homebrew, None, today),
+            succeeded()
+        );
     }
 
     #[test]
