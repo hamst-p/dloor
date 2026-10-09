@@ -68,6 +68,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg yt-dlp
+
       - name: Install stable Rust
         run: |
           rustup toolchain install stable \
@@ -109,6 +114,8 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
           - os: macos-15
             target: aarch64-apple-darwin
           - os: macos-15-intel
@@ -119,6 +126,12 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Install Linux media tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y ffmpeg yt-dlp
 
       - name: Install stable Rust target
         env:
@@ -144,6 +157,18 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: cargo build --workspace --release --locked --bins --target "$TARGET"
+
+      - name: Run ARM64 tests
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo test --workspace --locked --target "$TARGET"
+
+      - name: Smoke test Linux CLI and headless TUI
+        if: runner.os == 'Linux'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/smoke-test-linux.py "target/$TARGET/release"
 
       - name: Create release archive
         env:

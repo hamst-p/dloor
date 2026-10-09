@@ -96,6 +96,10 @@ Tagged releases provide archives for:
 - macOS on Apple Silicon (`aarch64-apple-darwin`)
 - macOS on Intel (`x86_64-apple-darwin`)
 - Linux x86_64 with glibc (`x86_64-unknown-linux-gnu`)
+- Linux ARM64 with glibc (`aarch64-unknown-linux-gnu`), including Raspberry Pi
+  running a 64-bit OS
+
+Linux binaries are built on Ubuntu 22.04 and support glibc 2.35 or newer.
 
 Download the archive for your platform from
 [GitHub Releases](https://github.com/hamst-p/dloor/releases), verify it against
@@ -138,6 +142,60 @@ For day-to-day development:
 ```bash
 cargo run -p dloor-tui
 ```
+
+### Raspberry Pi (Linux ARM64)
+
+Use Raspberry Pi OS **64-bit**, Bookworm or newer, or Ubuntu 22.04 or newer
+for ARM64. A 32-bit OS needs a different binary even on a 64-bit Raspberry Pi.
+Confirm the userspace architecture before installing:
+
+```bash
+dpkg --print-architecture  # must print arm64
+getconf LONG_BIT           # must print 64
+```
+
+Install the required media tools:
+
+```bash
+sudo apt update
+sudo apt install ffmpeg yt-dlp
+```
+
+For tagged releases, choose the archive ending in
+`aarch64-unknown-linux-gnu.tar.gz`. Before a new tagged release is available,
+download the `dloor-aarch64-unknown-linux-gnu` artifact from the latest successful
+`main` run on the [CI page](https://github.com/hamst-p/dloor/actions/workflows/ci.yml).
+Unzip the artifact, then run these commands in the extracted directory:
+
+```bash
+sha256sum -c SHA256SUMS
+tar -xzf dloor-aarch64-unknown-linux-gnu.tar.gz
+mkdir -p "$HOME/.local/bin"
+install -m 0755 dloor-aarch64-unknown-linux-gnu/dloor "$HOME/.local/bin/dloor"
+install -m 0755 dloor-aarch64-unknown-linux-gnu/dloor-cli "$HOME/.local/bin/dloor-cli"
+export PATH="$HOME/.local/bin:$PATH"
+dloor
+```
+
+Add the `PATH` line to your shell profile for later sessions. Tagged archives
+include the version in their directory name, so adjust the extraction and
+installation paths when using a release instead of a CI artifact.
+
+You can also build directly on the Pi. Install a current stable Rust toolchain
+with `rustup` as described below, then use one build job to limit memory use:
+
+```bash
+sudo apt install build-essential curl git
+git clone https://github.com/hamst-p/dloor.git
+cd dloor
+cargo install --path dloor-tui --locked --force --jobs 1
+cargo install --path dloor-cli --locked --force --jobs 1
+```
+
+The TUI also works in Raspberry Pi OS Lite or over SSH. Clipboard detection is
+optional; paste the URL manually when there is no desktop clipboard. Video
+compression uses software `libx264` encoding, so its speed depends on the Pi's
+CPU.
 
 ## Requirements
 
@@ -587,9 +645,13 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 Pull requests and pushes to `main` run the same checks on Ubuntu through GitHub
-Actions, with Cargo registry, Git, and build caches. Pushing a `v*` tag whose
+Actions on both x86_64 and native ARM64, with Cargo registry, Git, and build
+caches. Each Linux job installs ffmpeg for the real codec-conversion test,
+builds both release binaries, checks CLI help/version and TUI startup/quit
+without a display server, and uploads an installable archive with a checksum.
+Pushing a `v*` tag whose
 value exactly matches the shared Cargo package version runs the quality gate,
-builds the three supported native targets, publishes `.tar.gz` archives, and
+builds the four supported native targets, publishes `.tar.gz` archives, and
 generates `SHA256SUMS` in a GitHub Release.
 
 Project layout:
