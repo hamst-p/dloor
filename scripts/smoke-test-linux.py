@@ -5,6 +5,7 @@ import fcntl
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -12,6 +13,8 @@ import sys
 import tempfile
 import termios
 import time
+
+ANSI_SEQUENCE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def attach_terminal():
@@ -46,10 +49,18 @@ def check_tui(binary, environment):
                 if not chunk:
                     break
                 output.extend(chunk)
-                if not sent_quit and b"Input URL" in output:
+                # Ratatui skips blank cells and uses cursor moves between words.
+                visible = ANSI_SEQUENCE.sub(b"", output)
+                if not sent_quit and b"InputURL" in b"".join(visible.split()):
                     os.write(master, b"q")
                     sent_quit = True
-        result = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        try:
+            result = process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"TUI timed out (quit sent: {sent_quit}):\n"
+                + ANSI_SEQUENCE.sub(b"", output).decode(errors="replace")
+            ) from error
         if result != 0 or not sent_quit or b"\x1b[?1049l" not in output:
             raise RuntimeError(
                 f"TUI did not render and exit cleanly (status {result}):\n"
